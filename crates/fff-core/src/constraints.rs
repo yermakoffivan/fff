@@ -11,7 +11,6 @@ use fff_query_parser::{Constraint, GitStatusFilter};
 use smallvec::SmallVec;
 
 use crate::git::is_modified_status;
-use crate::simd_path::PATH_BUF_SIZE;
 
 /// Case-insensitive ASCII substring search without allocation.
 /// `needle` must already be lowercase.
@@ -49,16 +48,14 @@ const PAR_THRESHOLD: usize = 10_000;
 /// All path accessors write into caller-provided buffers to avoid allocation
 /// on hot paths. The buffers must be at least 512 bytes.
 pub trait Constrainable {
-    /// Write the file name component into `buf`.
-    /// Returns `&str` over the written bytes (e.g. "main.rs").
-    fn write_file_name<'a>(&self, arena: *const u8, buf: &'a mut [u8]) -> &'a str;
+    /// Write the file name component into `out` (clears first, reuses buffer).
+    fn write_file_name(&self, arena: *const u8, out: &mut String);
 
     /// The git status of this item, if available.
     fn git_status(&self) -> Option<git2::Status>;
 
-    /// Write the full relative path (dir + filename) into `buf`.
-    /// Returns `&str` over the written bytes.
-    fn write_relative_path<'a>(&self, arena: *const u8, buf: &'a mut [u8]) -> &'a str;
+    /// Write the full relative path into `out` (clears first, reuses buffer).
+    fn write_relative_path(&self, arena: *const u8, out: &mut String);
 }
 
 /// Check if a relative path ends with the given suffix at a `/` boundary (case-insensitive).
@@ -134,7 +131,9 @@ pub fn path_contains_segment(path: &str, segment: &str) -> bool {
     false
 }
 
-/// Check if an item at given index matches a constraint (single-pass friendly, allocation-free)
+/// Check if an item at given index matches a constraint (single-pass friendly).
+///
+/// Callers provide reusable `String` buffers to avoid per-call allocation.
 #[inline]
 fn item_matches_constraint_at_index<T: Constrainable>(
     item: &T,
@@ -144,12 +143,13 @@ fn item_matches_constraint_at_index<T: Constrainable>(
     glob_idx: &mut usize,
     negate: bool,
     arena: *const u8,
+    fname_buf: &mut String,
+    path_buf: &mut String,
 ) -> bool {
     let matches = match constraint {
         Constraint::Extension(ext) => {
-            let mut fname_buf = [0u8; 256];
-            let fname = item.write_file_name(arena, &mut fname_buf);
-            file_has_extension(fname, ext)
+            item.write_file_name(arena, fname_buf);
+            file_has_extension(fname_buf, ext)
         }
         Constraint::Glob(_) => {
             let result = glob_results
@@ -164,14 +164,12 @@ fn item_matches_constraint_at_index<T: Constrainable>(
             return if negate { !result } else { result };
         }
         Constraint::PathSegment(segment) => {
-            let mut buf = [0u8; PATH_BUF_SIZE];
-            let path = item.write_relative_path(arena, &mut buf);
-            path_contains_segment(path, segment)
+            item.write_relative_path(arena, path_buf);
+            path_contains_segment(path_buf, segment)
         }
         Constraint::FilePath(suffix) => {
-            let mut buf = [0u8; PATH_BUF_SIZE];
-            let path = item.write_relative_path(arena, &mut buf);
-            path_ends_with_suffix(path, suffix)
+            item.write_relative_path(arena, path_buf);
+            path_ends_with_suffix(path_buf, suffix)
         }
         Constraint::GitStatus(status_filter) => match (item.git_status(), status_filter) {
             (Some(status), GitStatusFilter::Modified) => is_modified_status(status),
@@ -196,14 +194,15 @@ fn item_matches_constraint_at_index<T: Constrainable>(
                 glob_idx,
                 !negate,
                 arena,
+                fname_buf,
+                path_buf,
             );
         }
 
         // only works with negation
         Constraint::Text(text) => {
-            let mut buf = [0u8; PATH_BUF_SIZE];
-            let path = item.write_relative_path(arena, &mut buf);
-            contains_ascii_ci(path, text)
+            item.write_relative_path(arena, path_buf);
+            contains_ascii_ci(path_buf, text)
         }
 
         // Parts and Exclude are handled at a higher level
@@ -249,11 +248,11 @@ pub fn apply_constraints<'a, T: Constrainable + Sync>(
         // One allocation for the buffer, one for offsets — NOT one String per file.
         let mut path_buf = Vec::<u8>::new();
         let mut offsets = Vec::<(usize, usize)>::with_capacity(items.len());
-        let mut tmp = [0u8; PATH_BUF_SIZE];
+        let mut tmp = String::with_capacity(64);
         for item in items.iter() {
             let start = path_buf.len();
-            let rel = item.write_relative_path(arena, &mut tmp);
-            path_buf.extend_from_slice(rel.as_bytes());
+            item.write_relative_path(arena, &mut tmp);
+            path_buf.extend_from_slice(tmp.as_bytes());
             offsets.push((start, path_buf.len() - start));
         }
         let path_refs: Vec<&str> = offsets
@@ -266,42 +265,80 @@ pub fn apply_constraints<'a, T: Constrainable + Sync>(
     };
 
     let arena_ptr = crate::simd_path::ArenaPtr::new(arena);
-    let matches_constraints = |i: usize, item: &T| -> bool {
-        if !extensions.is_empty() {
-            let mut fname_buf = [0u8; 256];
-            let fname = item.write_file_name(arena_ptr.as_ptr(), &mut fname_buf);
-            if !extensions.iter().any(|ext| file_has_extension(fname, ext)) {
-                return false;
-            }
-        }
-
-        let mut glob_idx = 0;
-        other_constraints.iter().all(|constraint| {
-            item_matches_constraint_at_index(
-                item,
-                i,
-                constraint,
-                &glob_results,
-                &mut glob_idx,
-                false,
-                arena_ptr.as_ptr(),
-            )
-        })
-    };
 
     let filtered: Vec<&T> = if items.len() >= PAR_THRESHOLD {
         use rayon::prelude::*;
         items
             .par_iter()
             .enumerate()
-            .filter(|(i, item)| matches_constraints(*i, item))
-            .map(|(_, item)| item)
+            .map_init(
+                || (String::with_capacity(64), String::with_capacity(64)),
+                |(fname_buf, path_buf), (i, item)| {
+                    if !extensions.is_empty() {
+                        item.write_file_name(arena_ptr.as_ptr(), fname_buf);
+                        if !extensions
+                            .iter()
+                            .any(|ext| file_has_extension(fname_buf, ext))
+                        {
+                            return None;
+                        }
+                    }
+
+                    let mut glob_idx = 0;
+                    if other_constraints.iter().all(|constraint| {
+                        item_matches_constraint_at_index(
+                            item,
+                            i,
+                            constraint,
+                            &glob_results,
+                            &mut glob_idx,
+                            false,
+                            arena_ptr.as_ptr(),
+                            fname_buf,
+                            path_buf,
+                        )
+                    }) {
+                        Some(item)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .flatten()
             .collect()
     } else {
+        let mut fname_buf = String::with_capacity(64);
+        let mut path_buf = String::with_capacity(64);
+
         items
             .iter()
             .enumerate()
-            .filter(|(i, item)| matches_constraints(*i, item))
+            .filter(|&(i, item)| {
+                if !extensions.is_empty() {
+                    item.write_file_name(arena_ptr.as_ptr(), &mut fname_buf);
+                    if !extensions
+                        .iter()
+                        .any(|ext| file_has_extension(&fname_buf, ext))
+                    {
+                        return false;
+                    }
+                }
+
+                let mut glob_idx = 0;
+                other_constraints.iter().all(|constraint| {
+                    item_matches_constraint_at_index(
+                        item,
+                        i,
+                        constraint,
+                        &glob_results,
+                        &mut glob_idx,
+                        false,
+                        arena_ptr.as_ptr(),
+                        &mut fname_buf,
+                        &mut path_buf,
+                    )
+                })
+            })
             .map(|(_, item)| item)
             .collect()
     };

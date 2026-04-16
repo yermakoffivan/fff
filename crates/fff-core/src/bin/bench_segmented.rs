@@ -75,6 +75,12 @@ fn main() {
     // Struct size analysis
     let file_item_size = std::mem::size_of::<fff_search::types::FileItem>();
     let dir_item_size = std::mem::size_of::<fff_search::types::DirItem>();
+    let chunked_string_size = std::mem::size_of::<fff_search::simd_path::ChunkedString>();
+    let chunk_indices_size = std::mem::size_of::<fff_search::simd_path::ChunkIndices>();
+    eprintln!(
+        "ChunkedString: {} bytes, ChunkIndices: {} bytes",
+        chunked_string_size, chunk_indices_size,
+    );
     eprintln!(
         "=== {} ===",
         repo_path.rsplit('/').next().unwrap_or(repo_path)

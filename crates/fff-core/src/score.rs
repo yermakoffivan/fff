@@ -2,7 +2,7 @@ use crate::{
     constraints::apply_constraints,
     git::is_modified_status,
     path_utils::calculate_distance_penalty,
-    simd_path::{ArenaPtr, PATH_BUF_SIZE},
+    simd_path::ArenaPtr,
     sort_buffer::{sort_by_key_with_buffer, sort_with_buffer},
     types::{FileItem, Score, ScoringContext},
 };
@@ -140,9 +140,9 @@ fn match_fuzzy_parts(
             .into_iter()
             .filter_map(|mut m| {
                 let file = working_files.index(m.index as usize);
-                let mut buf = [0u8; PATH_BUF_SIZE];
-                let path = file.write_relative_path(arena_base, &mut buf);
-                let part_matches = neo_frizbee::match_list(part, &[path], &part_options);
+                let mut buf = String::with_capacity(64);
+                file.write_relative_path(arena_base, &mut buf);
+                let part_matches = neo_frizbee::match_list(part, &[buf.as_str()], &part_options);
                 let part_match = part_matches.first()?;
 
                 // Sum scores
@@ -238,8 +238,7 @@ pub fn match_and_score_files<'a>(
 
             if match_start_approx < filename_start {
                 fallback_indices.push(i as u32);
-                let mut fbuf = [0u8; 256];
-                fallback_filenames.push(file.path.file_name(arena_base, &mut fbuf).to_string());
+                fallback_filenames.push(file.file_name(arena_base));
             }
         }
 
@@ -267,6 +266,8 @@ pub fn match_and_score_files<'a>(
 
     let path_matches_count = path_matches.len();
     let mut next_filename_match_cursor = 0;
+    let mut dir_buf = String::with_capacity(64);
+    let mut fname_buf = String::with_capacity(32);
     let results: Vec<_> = path_matches
         .into_iter()
         .enumerate()
@@ -283,9 +284,15 @@ pub fn match_and_score_files<'a>(
                 0
             };
 
-            let mut dir_buf = [0u8; PATH_BUF_SIZE];
-            let dir = file.path.dir_str(arena_base, &mut dir_buf);
-            let distance_penalty = calculate_distance_penalty(context.current_file, dir);
+            if context.current_file.is_some() || context.last_same_query_match.is_some() {
+                file.write_dir_str(arena_base, &mut dir_buf);
+            }
+
+            let distance_penalty = if context.current_file.is_some() {
+                calculate_distance_penalty(context.current_file, &dir_buf)
+            } else {
+                0
+            };
 
             let filename_start = file.filename_offset_in_relative() as u16;
             let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
@@ -306,13 +313,14 @@ pub fn match_and_score_files<'a>(
                 None
             };
 
-            let mut fname_buf = [0u8; 256];
-            let fname = file.path.file_name(arena_base, &mut fname_buf);
             let is_filename_match = end_col_filename_match || simd_filename_match.is_some();
+            let fname_len = file.path.byte_len as usize - file.path.filename_offset as usize;
+
             let is_exact_filename = simd_filename_match.is_some_and(|m| m.exact)
-                || (end_col_filename_match
-                    && main_needle_len as usize == fname.len()
-                    && main_needle.eq_ignore_ascii_case(fname.as_bytes()));
+                || (end_col_filename_match && main_needle_len as usize == fname_len && {
+                    file.write_file_name(arena_base, &mut fname_buf);
+                    main_needle.eq_ignore_ascii_case(fname_buf.as_bytes())
+                });
 
             let mut has_special_filename_bonus = false;
             let filename_bonus = if is_exact_filename {
@@ -326,9 +334,14 @@ pub fn match_and_score_files<'a>(
                 } else {
                     max_bonus
                 }
-            } else if !is_filename_match && is_special_entry_point_file(fname) {
-                has_special_filename_bonus = true;
-                base_score * 5 / 100
+            } else if !is_filename_match && (5..=11).contains(&fname_len) {
+                file.write_file_name(arena_base, &mut fname_buf);
+                if is_special_entry_point_file(&fname_buf) {
+                    has_special_filename_bonus = true;
+                    base_score * 5 / 100
+                } else {
+                    0
+                }
             } else {
                 0
             };
@@ -338,9 +351,13 @@ pub fn match_and_score_files<'a>(
             let combo_match_boost = {
                 let last_same_query_match = context.last_same_query_match.as_ref().filter(|m| {
                     let file_path_str = m.file_path.to_string_lossy();
-                    file_path_str.len() >= dir.len() + fname.len()
-                        && file_path_str.ends_with(fname)
-                        && file_path_str[..file_path_str.len() - fname.len()].ends_with(dir)
+                    let total_len = file.path.byte_len as usize;
+                    if file_path_str.len() < total_len {
+                        return false;
+                    }
+                    // Reuse dir_buf (already has capacity) for the full path
+                    file.write_relative_path(arena_base, &mut dir_buf);
+                    file_path_str.ends_with(dir_buf.as_str())
                 });
 
                 match last_same_query_match {
@@ -1132,6 +1149,114 @@ mod filename_bonus_tests {
         assert!(
             !matches.is_empty(),
             "'core' should match the lowercase path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod typo_resistance_tests {
+    use super::*;
+    use crate::types::PaginationArgs;
+    use fff_query_parser::QueryParser;
+
+    fn make_files(paths: &[&str]) -> (Vec<FileItem>, *const u8) {
+        let path_strings: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        let items: Vec<FileItem> = paths
+            .iter()
+            .map(|p| {
+                let fname = p.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
+                FileItem::new_raw(fname, 0, 0, None, false)
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&path_strings, &items);
+        let arena = store.arena_base_ptr();
+        let mut result: Vec<FileItem> = items;
+        for (i, file) in result.iter_mut().enumerate() {
+            file.set_path(strings[i].clone());
+        }
+        std::mem::forget(store);
+        (result, arena)
+    }
+
+    fn search_with_typos(
+        files: &[FileItem],
+        query: &str,
+        arena: *const u8,
+        max_typos: u16,
+    ) -> Vec<String> {
+        let parser = QueryParser::default();
+        let parsed = parser.parse(query);
+        let ctx = ScoringContext {
+            query: &parsed,
+            max_threads: 1,
+            max_typos,
+            current_file: None,
+            last_same_query_match: None,
+            project_path: None,
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 100,
+            },
+        };
+        let (items, _, _) = match_and_score_files(files, &ctx, arena);
+        items
+            .iter()
+            .map(|f| f.relative_path(arena))
+            .collect()
+    }
+
+    #[test]
+    fn test_typo_resistant_long_query() {
+        let (files, arena) = make_files(&[
+            "src/pricing/bid_comparison_supplier_part_cost_modifiers.rs",
+            "src/pricing/bid_evaluation_handler.rs",
+            "src/pricing/supplier_contract_terms.rs",
+            "src/models/purchase_order.rs",
+            "src/models/inventory_item.rs",
+            "src/controllers/user_controller.rs",
+            "src/controllers/admin_controller.rs",
+            "src/services/notification_service.rs",
+            "src/services/email_dispatcher.rs",
+            "src/utils/string_helpers.rs",
+            "src/utils/date_formatter.rs",
+            "src/db/migration_runner.rs",
+            "src/db/connection_pool.rs",
+            "src/config/app_settings.rs",
+            "src/config/feature_flags.rs",
+        ]);
+
+        // Exact substring — must always match
+        let results = search_with_typos(&files, "bid_comparison", arena, 6);
+        assert!(
+            results.iter().any(|p| p.contains("bid_comparison_supplier_part_cost_modifiers")),
+            "exact substring 'bid_comparison' should match, got: {results:?}"
+        );
+
+        // Concatenated query with typos — the real-world scenario.
+        // "bidcomparsionsupplierpartcostmodfiers" is a smushed version of
+        // "bid_comparison_supplier_part_cost_modifiers" with 2 typos
+        // (comparsion → comparison, modfiers → modifiers).
+        let results = search_with_typos(&files, "bidcomparsionsupplierpartcostmodfiers", arena, 6);
+        assert!(
+            results.iter().any(|p| p.contains("bid_comparison_supplier_part_cost_modifiers")),
+            "typo query 'bidcomparsionsupplierpartcostmodfiers' should match, got: {results:?}"
+        );
+
+        // Shorter typo query
+        let results = search_with_typos(&files, "bidcomp", arena, 4);
+        assert!(
+            results.iter().any(|p| p.contains("bid_comparison")),
+            "'bidcomp' should match bid_comparison file, got: {results:?}"
+        );
+
+        // Query with missing underscores
+        let results = search_with_typos(&files, "supplierpartcost", arena, 6);
+        assert!(
+            results.iter().any(|p| p.contains("bid_comparison_supplier_part_cost_modifiers")),
+            "'supplierpartcost' should match, got: {results:?}"
         );
     }
 }

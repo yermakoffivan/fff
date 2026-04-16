@@ -203,30 +203,48 @@ impl FileItem {
         self.parent_dir = idx;
     }
 
-    /// The directory portion of the relative path. **Allocates** (cold path).
-    ///
-    /// `arena` is `ChunkedPathStore::arena_base_ptr()`.
+    /// The directory portion of the relative path.
+    /// Pre-allocates with 64 bytes capacity; reuses on subsequent calls
+    /// if the caller passes the return value back via `write_dir_str`.
     #[inline]
     pub fn dir_str(&self, arena: *const u8) -> String {
-        self.path.dir_string(arena)
+        let mut s = String::with_capacity(64);
+        self.path.write_dir_to(arena, &mut s);
+        s
     }
 
-    /// The filename component. **Allocates** (cold path).
+    /// Write the directory portion into a reusable `String`.
+    #[inline]
+    pub fn write_dir_str(&self, arena: *const u8, out: &mut String) {
+        self.path.write_dir_to(arena, out);
+    }
+
+    /// The filename component.
     #[inline]
     pub fn file_name(&self, arena: *const u8) -> String {
-        self.path.file_name_string(arena)
+        let mut s = String::with_capacity(32);
+        self.path.write_file_name_to(arena, &mut s);
+        s
     }
 
-    /// The full relative path. **Allocates** (cold path).
+    /// Write the filename into a reusable `String`.
+    #[inline]
+    pub fn write_file_name(&self, arena: *const u8, out: &mut String) {
+        self.path.write_file_name_to(arena, out);
+    }
+
+    /// The full relative path.
     #[inline]
     pub fn relative_path(&self, arena: *const u8) -> String {
-        self.path.to_string(arena)
+        let mut s = String::with_capacity(64);
+        self.path.write_to_string(arena, &mut s);
+        s
     }
 
-    /// Write the full relative path into a caller buffer (hot path, zero-alloc).
+    /// Write the full relative path into a reusable `String`.
     #[inline]
-    pub fn write_relative_path<'a>(&self, arena: *const u8, buf: &'a mut [u8]) -> &'a str {
-        self.path.read_to_buf(arena, buf)
+    pub fn write_relative_path(&self, arena: *const u8, out: &mut String) {
+        self.path.write_to_string(arena, out);
     }
 
     /// Total byte length of the relative path.
@@ -247,7 +265,7 @@ impl FileItem {
         if other.len() != self.path.byte_len as usize {
             return false;
         }
-        let mut buf = [0u8; PATH_BUF_SIZE];
+        let mut buf = [0u8; 512];
         let mine = self.path.read_to_buf(arena, &mut buf);
         mine == other
     }
@@ -466,13 +484,13 @@ fn load_file_content(path: &Path, size: u64) -> Option<FileContent> {
 
 impl Constrainable for FileItem {
     #[inline]
-    fn write_file_name<'a>(&self, arena: *const u8, buf: &'a mut [u8]) -> &'a str {
-        self.path.file_name(arena, buf)
+    fn write_file_name(&self, arena: *const u8, out: &mut String) {
+        self.path.write_file_name_to(arena, out);
     }
 
     #[inline]
-    fn write_relative_path<'a>(&self, arena: *const u8, buf: &'a mut [u8]) -> &'a str {
-        self.path.read_to_buf(arena, buf)
+    fn write_relative_path(&self, arena: *const u8, out: &mut String) {
+        self.path.write_to_string(arena, out);
     }
 
     #[inline]
