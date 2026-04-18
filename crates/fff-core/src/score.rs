@@ -2,7 +2,7 @@ use crate::{
     constraints::apply_constraints,
     git::is_modified_status,
     path_utils::calculate_distance_penalty,
-    simd_path::ArenaPtr,
+    simd_path::{ArenaPtr, SimdChunk},
     sort_buffer::{sort_by_key_with_buffer, sort_with_buffer},
     types::{FileItem, Score, ScoringContext},
 };
@@ -26,6 +26,21 @@ impl<'a> FileItems<'a> {
     }
 }
 
+/// Resolve a FileItem's chunked path into frizbee's pointer buffer.
+/// Returns `Some((chunk_count, byte_len))` or `None` for deleted files.
+#[inline]
+fn resolve_file_chunks(
+    file: &FileItem,
+    arena: ArenaPtr,
+    buf: &mut [*const u8; 32],
+) -> Option<(usize, u16)> {
+    if file.is_deleted() {
+        return None;
+    }
+    let ptrs = file.path.resolve_ptrs(arena, buf);
+    Some((ptrs.len(), file.path.byte_len))
+}
+
 #[inline]
 fn match_fuzzy_parts(
     fuzzy_parts: &[&str],
@@ -45,39 +60,34 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
-    // Collect paths from the arena into a temporary Vec<String> for frizbee matching.
-    // This is the bridge between arena-stored paths and frizbee's Matchable trait.
-    // Deleted files get an empty string so their index stays aligned.
-    let paths: Vec<String> = match working_files {
-        FileItems::All(files) => files
-            .iter()
-            .map(|f| {
-                if f.is_deleted() {
-                    String::new()
-                } else {
-                    f.relative_path_from_arena(arena)
-                }
-            })
-            .collect(),
-        FileItems::Filtered(files) => files
-            .iter()
-            .map(|f| {
-                if f.is_deleted() {
-                    String::new()
-                } else {
-                    f.relative_path_from_arena(arena)
-                }
-            })
-            .collect(),
+    let resolve = |file: &FileItem, buf: &mut [*const u8; 32]| -> Option<(usize, u16)> {
+        resolve_file_chunks(file, arena, buf)
     };
 
-    let first_part_matches =
-        neo_frizbee::match_list_parallel(valid_parts[0], &paths, options, max_threads);
+    let first_part_matches = match working_files {
+        FileItems::All(files) => neo_frizbee::match_list_parallel_resolved(
+            valid_parts[0],
+            files,
+            &resolve,
+            options,
+            max_threads,
+        ),
+        FileItems::Filtered(files) => neo_frizbee::match_list_parallel_resolved(
+            valid_parts[0],
+            files.as_slice(),
+            &|file_ref: &&FileItem, buf: &mut [*const u8; 32]| {
+                resolve_file_chunks(file_ref, arena, buf)
+            },
+            options,
+            max_threads,
+        ),
+    };
 
     if valid_parts.len() == 1 {
         return first_part_matches;
     }
 
+    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
     let mut matches = first_part_matches;
     for part in valid_parts[1..].iter() {
         let mut part_options = *options;
@@ -87,9 +97,8 @@ fn match_fuzzy_parts(
             .into_iter()
             .filter_map(|mut m| {
                 let file = working_files.index(m.index as usize);
-                let mut buf = String::with_capacity(64);
-                file.write_relative_path_from_arena(arena, &mut buf);
-                let part_matches = neo_frizbee::match_list(part, &[buf.as_str()], &part_options);
+                let path_str = file.path.read_to_buf(arena, &mut path_buf);
+                let part_matches = neo_frizbee::match_list(part, &[path_str], &part_options);
                 let part_match = part_matches.first()?;
 
                 let total = (m.score as u32).saturating_add(part_match.score as u32);
@@ -194,7 +203,7 @@ fn match_and_score_in_arena<'a>(
     {
         vec![]
     } else {
-        let mut fallback_filenames: Vec<String> = Vec::new();
+        let mut fallback_items: Vec<&FileItem> = Vec::new();
 
         for (i, path_match) in path_matches.iter().enumerate() {
             let file = working_files.index(path_match.index as usize);
@@ -203,20 +212,38 @@ fn match_and_score_in_arena<'a>(
 
             if match_start_approx < filename_start {
                 fallback_indices.push(i as u32);
-                fallback_filenames.push(file.file_name_from_arena(arena));
+                fallback_items.push(file);
             }
         }
 
-        if fallback_filenames.is_empty() {
+        if fallback_items.is_empty() {
             vec![]
         } else {
-            let fallback_refs: Vec<&str> = fallback_filenames.iter().map(String::as_str).collect();
-            let mut matches = neo_frizbee::match_list_parallel(
+            let mut matches = neo_frizbee::match_list_parallel_resolved(
                 fuzzy_parts[0],
-                &fallback_refs,
+                &fallback_items,
+                &|item, chunk_buf| -> Option<(usize, u16)> {
+                    // pretty ugly way to express the map_init but it's fine for now
+                    // can't do stack here as the buffer needs to escape this region but can be one
+                    // per thread
+                    thread_local! {
+                        static SCRATCH: std::cell::UnsafeCell<SimdChunk> =
+                            const { std::cell::UnsafeCell::new(SimdChunk([0u8; crate::simd_path::SIMD_CHUNK_BYTES])) };
+                    }
+
+                    SCRATCH.with(|cell| {
+                        let scratch = unsafe { &mut (*cell.get()).0 };
+                        let (ptrs, fname_len) =
+                            item.path.resolve_filename_ptrs(arena, chunk_buf, scratch);
+                        if fname_len == 0 {
+                            return None;
+                        }
+                        Some((ptrs.len(), fname_len))
+                    })
+                },
                 &options,
-                if path_matches.len() > 10_000 {
-                    context.max_threads
+                if path_matches.len() > 4096 {
+                    context.max_threads.div_ceil(2048)
                 } else {
                     1
                 },
@@ -233,6 +260,8 @@ fn match_and_score_in_arena<'a>(
     let mut next_filename_match_cursor = 0;
     let mut dir_buf = String::with_capacity(64);
     let mut fname_buf = String::with_capacity(32);
+    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+
     let results: Vec<_> = path_matches
         .into_iter()
         .enumerate()
@@ -340,7 +369,7 @@ fn match_and_score_in_arena<'a>(
             // Uses suffix overlap — bytes matching from the end. A full prefix
             // match is just the 100% coverage case, so no separate branch needed.
             let path_alignment_bonus = if query_contains_path_separator {
-                let rel_path = file.relative_path_from_arena(arena);
+                let rel_path = file.path.read_to_buf(arena, &mut path_buf);
                 let path_bytes = rel_path.as_bytes();
                 let common_suffix = main_needle
                     .iter()
@@ -595,28 +624,7 @@ mod tests {
     use crate::types::PaginationArgs;
     use fff_query_parser::QueryParser;
 
-    // ── Helpers ──────────────────────────────────────────────────────────
-
-    fn create_test_file(path: &str, score: i32, modified: u64) -> (FileItem, Score) {
-        let file = FileItem::new_for_test(path, 0, modified, None, false);
-        let score_obj = Score {
-            total: score,
-            base_score: score,
-            filename_bonus: 0,
-            distance_penalty: 0,
-            special_filename_bonus: 0,
-            current_file_penalty: 0,
-            frecency_boost: 0,
-            git_status_boost: 0,
-            exact_match: false,
-            match_type: "test",
-            combo_match_boost: 0,
-            path_alignment_bonus: 0,
-        };
-        (file, score_obj)
-    }
-
-    fn build_test_files(specs: &[(&str, i32, u64)]) -> (Vec<(FileItem, Score)>, ArenaPtr) {
+    fn make_test_files(specs: &[(&str, i32, u64)]) -> (Vec<(FileItem, Score)>, ArenaPtr) {
         let path_strings: Vec<String> = specs.iter().map(|(p, _, _)| p.to_string()).collect();
         let items: Vec<FileItem> = specs
             .iter()
@@ -659,7 +667,7 @@ mod tests {
     #[test]
     fn test_partial_sort_descending() {
         // Create test data with known scores
-        let (test_data, arena) = build_test_files(&[
+        let (test_data, arena) = make_test_files(&[
             ("file1.rs", 100, 1000),
             ("file2.rs", 200, 2000),
             ("file3.rs", 50, 3000),
@@ -716,7 +724,7 @@ mod tests {
     #[test]
     fn test_partial_sort_with_same_scores() {
         // Test tiebreaker with modified time
-        let (test_data, _arena) = build_test_files(&[
+        let (test_data, _arena) = make_test_files(&[
             ("file1.rs", 100, 5000), // Same score, older
             ("file2.rs", 100, 8000), // Same score, newer
             ("file3.rs", 100, 3000), // Same score, oldest
@@ -767,7 +775,7 @@ mod tests {
     #[test]
     fn test_no_partial_sort_for_small_results() {
         // When results.len() <= threshold, should use regular sort
-        let (test_data, arena) = build_test_files(&[
+        let (test_data, arena) = make_test_files(&[
             ("file1.rs", 100, 1000),
             ("file2.rs", 200, 2000),
             ("file3.rs", 50, 3000),

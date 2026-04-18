@@ -42,7 +42,7 @@ impl std::fmt::Debug for ArenaPtr {
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
-struct SimdChunk([u8; SIMD_CHUNK_BYTES]);
+pub(crate) struct SimdChunk(pub(crate) [u8; SIMD_CHUNK_BYTES]);
 
 impl Default for SimdChunk {
     #[inline]
@@ -103,7 +103,6 @@ impl ChunkedString {
         self.indices[i]
     }
 
-    #[cfg(test)]
     #[inline]
     pub fn resolve_ptrs<'a>(
         &self,
@@ -116,6 +115,106 @@ impl ChunkedString {
             buf[i] = unsafe { base.add(idx as usize * SIMD_CHUNK_BYTES) };
         }
         &buf[..count]
+    }
+
+    /// Resolve chunk pointers for the filename portion only.
+    ///
+    /// When `filename_offset` falls mid-chunk, the first filename chunk is
+    /// copied into `scratch` (caller-owned, 16-byte aligned) so the returned
+    /// pointer slice always starts at byte 0 of the filename.
+    /// Returns `(chunk_ptrs, filename_byte_len)`.
+    #[inline]
+    pub fn resolve_filename_ptrs<'a>(
+        &self,
+        arena: ArenaPtr,
+        buf: &'a mut [*const u8; 32],
+        scratch: &'a mut [u8; SIMD_CHUNK_BYTES],
+    ) -> (&'a [*const u8], u16) {
+        let fname_offset = self.filename_offset as usize;
+        let fname_len = self.byte_len as usize - fname_offset;
+        if fname_len == 0 {
+            return (&[], 0);
+        }
+
+        let base = arena.as_ptr();
+        let start_chunk = fname_offset / SIMD_CHUNK_BYTES;
+        let offset_in_chunk = fname_offset % SIMD_CHUNK_BYTES;
+
+        if offset_in_chunk == 0 {
+            // Filename is chunk-aligned — just point directly into the arena.
+            let chunk_count = chunks_needed(fname_len);
+            for (i, &idx) in self.indices[start_chunk..start_chunk + chunk_count]
+                .iter()
+                .enumerate()
+            {
+                buf[i] = unsafe { base.add(idx as usize * SIMD_CHUNK_BYTES) };
+            }
+            return (&buf[..chunk_count], fname_len as u16);
+        }
+
+        // First chunk is partial — assemble the filename bytes into scratch
+        // so that byte 0 of scratch = first filename byte. Then subsequent
+        // chunks (if any) continue from the next arena chunk boundary.
+        //
+        // Layout: the full path's chunks look like:
+        //   chunk[start_chunk]: [... | fname byte 0 .. byte (16-offset-1)]
+        //   chunk[start_chunk+1]: [fname byte (16-offset) .. ]
+        //   ...
+        //
+        // We need to shift byte 0 of the filename to position 0 in scratch,
+        // then fill the rest of scratch from the next chunk(s) if needed.
+        *scratch = [0u8; SIMD_CHUNK_BYTES];
+        let first_arena_idx = self.indices[start_chunk] as usize;
+        let src = unsafe { base.add(first_arena_idx * SIMD_CHUNK_BYTES) };
+        let bytes_in_first_arena_chunk = SIMD_CHUNK_BYTES - offset_in_chunk;
+        let take_from_first = bytes_in_first_arena_chunk.min(fname_len);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.add(offset_in_chunk),
+                scratch.as_mut_ptr(),
+                take_from_first,
+            );
+        }
+
+        // If the first arena chunk didn't fill the scratch, pull from the next.
+        if take_from_first < SIMD_CHUNK_BYTES && take_from_first < fname_len {
+            let next_idx = self.indices[start_chunk + 1] as usize;
+            let next_src = unsafe { base.add(next_idx * SIMD_CHUNK_BYTES) };
+            let fill = (SIMD_CHUNK_BYTES - take_from_first).min(fname_len - take_from_first);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    next_src,
+                    scratch.as_mut_ptr().add(take_from_first),
+                    fill,
+                );
+            }
+        }
+        buf[0] = scratch.as_ptr();
+
+        // Any arena chunks beyond what scratch already consumed.
+        // Scratch covers bytes 0..(SIMD_CHUNK_BYTES-1) of the filename.
+        // Remaining chunks start at the arena chunk that holds byte SIMD_CHUNK_BYTES
+        // of the filename, which is at path byte (fname_offset + SIMD_CHUNK_BYTES).
+        let fname_bytes_covered_by_scratch = SIMD_CHUNK_BYTES.min(fname_len);
+        let remaining = fname_len - fname_bytes_covered_by_scratch;
+        if remaining == 0 {
+            return (&buf[..1], fname_len as u16);
+        }
+
+        // Which arena chunk holds byte SIMD_CHUNK_BYTES of the filename?
+        let second_fname_byte_in_path = fname_offset + SIMD_CHUNK_BYTES;
+        let arena_chunk_for_second = second_fname_byte_in_path / SIMD_CHUNK_BYTES;
+        let remaining_chunks = chunks_needed(remaining);
+        for (i, &idx) in self.indices
+            [arena_chunk_for_second..arena_chunk_for_second + remaining_chunks]
+            .iter()
+            .enumerate()
+        {
+            buf[1 + i] = unsafe { base.add(idx as usize * SIMD_CHUNK_BYTES) };
+        }
+
+        let total_chunks = 1 + remaining_chunks;
+        (&buf[..total_chunks], fname_len as u16)
     }
 
     /// Truncates at `buf.len()` if exceeded -- use `[u8; PATH_BUF_SIZE]` to avoid.
@@ -463,6 +562,85 @@ mod tests {
             std::str::from_utf8(&reconstructed).unwrap(),
             "src/components/Button.tsx"
         );
+    }
+
+    #[test]
+    fn test_resolve_filename_ptrs_mid_chunk() {
+        // "src/components/Button.tsx" = 25 bytes, filename_offset=15 ("Button.tsx"=10 bytes)
+        // offset_in_chunk = 15 % 16 = 15
+        let (store, strings, _files) = build_test_store(&["src/components/Button.tsx"]);
+        let arena = store.as_arena_ptr();
+        let cs = &strings[0];
+
+        assert_eq!(cs.filename_offset, 15);
+        assert_eq!(cs.byte_len, 25);
+
+        let mut ptrs = [std::ptr::null::<u8>(); 32];
+        let mut scratch = [0u8; SIMD_CHUNK_BYTES];
+        let (fname_ptrs, fname_len) = cs.resolve_filename_ptrs(arena, &mut ptrs, &mut scratch);
+        assert_eq!(fname_len, 10);
+
+        // Reconstruct filename from chunk pointers
+        let mut reconstructed = Vec::new();
+        for (i, &ptr) in fname_ptrs.iter().enumerate() {
+            let chunk = unsafe { std::slice::from_raw_parts(ptr, SIMD_CHUNK_BYTES) };
+            let start = i * SIMD_CHUNK_BYTES;
+            let take = SIMD_CHUNK_BYTES.min(fname_len as usize - start);
+            reconstructed.extend_from_slice(&chunk[..take]);
+        }
+        assert_eq!(std::str::from_utf8(&reconstructed).unwrap(), "Button.tsx");
+    }
+
+    #[test]
+    fn test_resolve_filename_ptrs_chunk_aligned() {
+        // "0123456789abcdef/file.txt" = 26 bytes, filename_offset=17
+        // offset_in_chunk = 17 % 16 = 1 (not aligned)
+        // Actually let's use a path where filename IS aligned:
+        // "0123456789abcdeffile.txt" = 24 bytes, filename_offset=16
+        let path = "0123456789abcdef/file.txt";
+        let (store, strings, _files) = build_test_store(&[path]);
+        let arena = store.as_arena_ptr();
+        let cs = &strings[0];
+
+        // filename_offset should be 17 (after the '/')
+        assert_eq!(cs.filename_offset, 17);
+
+        let mut ptrs = [std::ptr::null::<u8>(); 32];
+        let mut scratch = [0u8; SIMD_CHUNK_BYTES];
+        let (fname_ptrs, fname_len) = cs.resolve_filename_ptrs(arena, &mut ptrs, &mut scratch);
+        assert_eq!(fname_len, 8); // "file.txt"
+
+        let mut reconstructed = Vec::new();
+        for (i, &ptr) in fname_ptrs.iter().enumerate() {
+            let chunk = unsafe { std::slice::from_raw_parts(ptr, SIMD_CHUNK_BYTES) };
+            let start = i * SIMD_CHUNK_BYTES;
+            let take = SIMD_CHUNK_BYTES.min(fname_len as usize - start);
+            reconstructed.extend_from_slice(&chunk[..take]);
+        }
+        assert_eq!(std::str::from_utf8(&reconstructed).unwrap(), "file.txt");
+    }
+
+    #[test]
+    fn test_resolve_filename_ptrs_root_file() {
+        let (store, strings, _files) = build_test_store(&["Cargo.toml"]);
+        let arena = store.as_arena_ptr();
+        let cs = &strings[0];
+
+        assert_eq!(cs.filename_offset, 0);
+
+        let mut ptrs = [std::ptr::null::<u8>(); 32];
+        let mut scratch = [0u8; SIMD_CHUNK_BYTES];
+        let (fname_ptrs, fname_len) = cs.resolve_filename_ptrs(arena, &mut ptrs, &mut scratch);
+        assert_eq!(fname_len, 10);
+
+        let mut reconstructed = Vec::new();
+        for (i, &ptr) in fname_ptrs.iter().enumerate() {
+            let chunk = unsafe { std::slice::from_raw_parts(ptr, SIMD_CHUNK_BYTES) };
+            let start = i * SIMD_CHUNK_BYTES;
+            let take = SIMD_CHUNK_BYTES.min(fname_len as usize - start);
+            reconstructed.extend_from_slice(&chunk[..take]);
+        }
+        assert_eq!(std::str::from_utf8(&reconstructed).unwrap(), "Cargo.toml");
     }
 
     #[test]
