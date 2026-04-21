@@ -2554,7 +2554,10 @@ mod tests {
             .position(|f| f.relative_path(&picker) == overflow_rel)
             .expect("overflow file should be present");
         assert!(overflow_abs >= base_count);
-        assert!(overflow_abs < 64, "index must fit in the single bitset word");
+        assert!(
+            overflow_abs < 64,
+            "index must fit in the single bitset word"
+        );
 
         if let Some(overlay) = picker.bigram_overlay() {
             overlay
