@@ -41,7 +41,7 @@ use crate::ignore::non_git_repo_overrides;
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
 use crate::score::fuzzy_match_and_score_files;
-use crate::shared::{SharedFrecency, SharedPicker};
+use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::{ArenaPtr, PATH_BUF_SIZE};
 use crate::types::{
     ContentCacheBudget, DirItem, DirSearchResult, FileItem, MixedItemRef, MixedSearchResult,
@@ -287,11 +287,11 @@ impl FileSync {
 
     /// Find a file in the overflow portion by relative path (linear scan).
     /// Returns the absolute index into `files` (i.e. `base_count + position`).
-    fn find_overflow_index(&self, rel_path: &str) -> Option<usize> {
+    fn find_overflow_index(&self, relative_path: &str) -> Option<usize> {
         let overflow_arena = self.overflow_arena_ptr();
         self.files[self.base_count..]
             .iter()
-            .position(|f| f.relative_path_eq(overflow_arena, rel_path))
+            .position(|f| f.relative_path_eq(overflow_arena, relative_path))
             .map(|pos| self.base_count + pos)
     }
 
@@ -495,7 +495,7 @@ pub struct FilePicker {
     cache_budget: Arc<ContentCacheBudget>,
     has_explicit_cache_budget: bool,
     scanned_files_count: Arc<AtomicUsize>,
-    background_watcher: Option<BackgroundWatcher>,
+    pub(crate) background_watcher: Option<BackgroundWatcher>,
     enable_mmap_cache: bool,
     enable_content_indexing: bool,
     watch: bool,
@@ -635,8 +635,12 @@ impl FilePicker {
         )
     }
 
-    pub(crate) fn install_background_watcher(&mut self, watcher: BackgroundWatcher) {
-        self.background_watcher = Some(watcher);
+    /// Borrow the active background watcher, if one is installed.
+    ///
+    /// Used by the rescan orchestrator to re-register directory watches
+    /// after a `commit_new_sync` (see [`crate::scan::resync_watcher_dirs`]).
+    pub(crate) fn background_watcher_ref(&self) -> Option<&BackgroundWatcher> {
+        self.background_watcher.as_ref()
     }
 
     pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
@@ -730,7 +734,7 @@ impl FilePicker {
         }
 
         // fallback that should never be happening, but it is possible to get the file
-        // path from the absolute path using componenets api as well:
+        // path from the absolute path using components api as well:
         let files = self.sync_data.files();
         let arena = self.arena_base_ptr();
         let mut current = self.base_path.clone();
@@ -807,7 +811,7 @@ impl FilePicker {
     /// Create a picker, place it into the shared handle, and spawn background
     /// indexing + file-system watcher. This is the default entry point.
     pub fn new_with_shared_state(
-        shared_picker: SharedPicker,
+        shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         options: FilePickerOptions,
     ) -> Result<(), Error> {
@@ -914,7 +918,7 @@ impl FilePicker {
     /// [`collect_files`](Self::collect_files) or after an initial scan.
     pub fn spawn_background_watcher(
         &mut self,
-        shared_picker: &SharedPicker,
+        shared_picker: &SharedFilePicker,
         shared_frecency: &SharedFrecency,
     ) -> Result<(), Error> {
         let git_workdir = self.sync_data.git_workdir.clone();
@@ -1319,7 +1323,7 @@ impl FilePicker {
     }
 
     /// Update git statuses for files, using the provided shared frecency tracker.
-    pub fn update_git_statuses(
+    pub(crate) fn update_git_statuses(
         &mut self,
         status_cache: GitStatusCache,
         shared_frecency: &SharedFrecency,
@@ -1432,98 +1436,79 @@ impl FilePicker {
     #[tracing::instrument(skip(self), name = "timing_update", level = Level::DEBUG)]
     pub fn on_create_or_modify(&mut self, path: impl AsRef<Path> + Debug) -> Option<&FileItem> {
         let path = path.as_ref();
+
+        if let Ok(idx) = self.sync_data.find_file_index(path, &self.base_path) {
+            return self.handle_file_modify(path, FileSlot::Base(idx));
+        }
+
+        let relative_path = self.to_relative_path(path)?;
+        if let Some(idx) = self.sync_data.find_overflow_index(relative_path) {
+            return self.handle_file_modify(path, FileSlot::Overflow(idx));
+        }
+
+        self.add_new_file(path)
+    }
+
+    #[tracing::instrument(skip_all, fields(path = ?path), level = Level::DEBUG)]
+    fn handle_file_modify(&mut self, path: &Path, slot: FileSlot) -> Option<&FileItem> {
         let overlay = self.sync_data.bigram_overlay.as_ref().map(Arc::clone);
+        let pos = slot.index();
+        let file = self.sync_data.get_file_mut(pos)?;
 
-        if let Ok(pos) = self.sync_data.find_file_index(path, &self.base_path) {
-            let file = self.sync_data.get_file_mut(pos)?;
+        let metadata = std::fs::metadata(path)
+            .inspect_err(|e| {
+                tracing::error!(
+                    ?e,
+                    "File market for modification doesn't exists or not accessible"
+                )
+            })
+            .ok()?; // if we can't read metadata this file either doesn't exists or not accessible
 
-            if file.is_deleted() {
-                // Resurrect tombstoned file.
-                file.set_deleted(false);
-                debug!(
-                    "on_create_or_modify: resurrected tombstoned file at index {}",
-                    pos
-                );
-            }
+        let size = metadata.len();
+        let modified_time = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
 
-            debug!(
-                "on_create_or_modify: file EXISTS at index {}, updating metadata",
-                pos
-            );
+        if file.is_deleted() {
+            file.set_deleted(false);
+        }
 
-            let modified = match std::fs::metadata(path) {
-                Ok(metadata) => metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()),
-                Err(e) => {
-                    error!("Failed to get metadata for {}: {}", path.display(), e);
-                    None
-                }
+        file.update_metadata(&self.cache_budget, modified_time, Some(size));
+
+        // only base-region entries participate in the bigram overlay
+        if matches!(slot, FileSlot::Base(_))
+            && let Some(ref overlay) = overlay
+        {
+            let in_indexable = {
+                let guard = overlay.read();
+                pos < guard.base_file_count()
             };
 
-            if let Some(modified) = modified {
-                let modified = modified.as_secs();
-                if file.modified < modified {
-                    file.modified = modified;
-                    file.invalidate_mmap(&self.cache_budget);
-                }
+            if in_indexable && let Ok(content) = std::fs::read(path) {
+                overlay.write().modify_file(pos, &content);
             }
-
-            // Update the bigram overlay for this modified file — but only
-            // if it lives in the indexable region. The overlay's bitsets are
-            // sized to `base_file_count == indexable_count`; modifying a
-            // file past that boundary would write a key the filter can't
-            // resolve back to a column.
-            if let Some(ref overlay) = overlay {
-                let in_indexable = {
-                    let guard = overlay.read();
-                    pos < guard.base_file_count()
-                };
-                if in_indexable && let Ok(content) = std::fs::read(path) {
-                    overlay.write().modify_file(pos, &content);
-                }
-            }
-
-            return Some(&*file);
         }
 
-        // Check overflow for existing added files.
-        let rel_path = self.to_relative_path(path).unwrap_or("");
-        if let Some(abs_idx) = self.sync_data.find_overflow_index(rel_path) {
-            let file = self.sync_data.get_file_mut(abs_idx)?;
-            let modified = std::fs::metadata(path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok());
-            if let Some(modified) = modified {
-                let modified = modified.as_secs();
-                if file.modified < modified {
-                    file.modified = modified;
-                    file.invalidate_mmap(&self.cache_budget);
-                }
-            }
-            return Some(&*file);
-        }
+        Some(&*self.sync_data.get_file_mut(pos)?)
+    }
 
-        // New file — append to overflow (preserves base indices for bigram).
-        debug!(
-            "on_create_or_modify: file NEW, appending to overflow (base: {}, overflow: {})",
-            self.sync_data.base_count,
-            self.sync_data.overflow_files().len(),
-        );
-
+    /// Adds a new file from path to the picker, even if it should be ignored
+    #[tracing::instrument(skip(self))]
+    pub fn add_new_file(&mut self, path: &Path) -> Option<&FileItem> {
         let (mut file_item, rel_path) = FileItem::new(path.to_path_buf(), &self.base_path, None);
 
-        // Lazily create the shared overflow builder on first use.
+        // Lazily create the shared overflow builder if not exists yet
         let builder = self
             .sync_data
             .overflow_builder
             .get_or_insert_with(|| crate::simd_path::ChunkedPathStoreBuilder::new(64));
 
-        let cs = builder.add_file_immediate(&rel_path, file_item.path.filename_offset);
-        file_item.set_path(cs);
+        let chunked_path = builder.add_file_immediate(&rel_path, file_item.path.filename_offset);
+        file_item.set_path(chunked_path);
         file_item.set_overflow(true);
+
         self.sync_data.files.push(file_item);
         self.sync_data.files.last()
     }
@@ -1725,6 +1710,20 @@ impl FilePicker {
     /// holding a lock on the picker.
     pub fn watcher_signal(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.signals.watcher_ready)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FileSlot {
+    Base(usize),
+    Overflow(usize),
+}
+
+impl FileSlot {
+    fn index(self) -> usize {
+        match self {
+            FileSlot::Base(i) | FileSlot::Overflow(i) => i,
+        }
     }
 }
 
@@ -2080,7 +2079,7 @@ pub(crate) fn walk_filesystem(
 }
 
 pub(crate) fn apply_git_status_and_frecency(
-    shared_picker: &SharedPicker,
+    shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
     git_handle: std::thread::JoinHandle<Option<GitStatusCache>>,
     mode: FFFMode,

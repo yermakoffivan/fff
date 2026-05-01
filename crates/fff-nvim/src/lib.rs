@@ -6,7 +6,7 @@ use fff::path_utils::expand_tilde;
 use fff::query_tracker::QueryTracker;
 use fff::{
     DbHealthChecker, Error, FFFMode, FileSearchConfig, FuzzySearchOptions, GrepConfig,
-    PaginationArgs, QueryParser, Score, SearchResult, SharedFrecency, SharedPicker,
+    PaginationArgs, QueryParser, Score, SearchResult, SharedFilePicker, SharedFrecency,
     SharedQueryTracker,
 };
 use mimalloc::MiMalloc;
@@ -27,7 +27,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 // the global state for neovim lives here for efficiency
 // lua ffi is pretty bad with the overhead of converting raw pointer into tables
-pub static FILE_PICKER: Lazy<SharedPicker> = Lazy::new(SharedPicker::default);
+pub static FILE_PICKER: Lazy<SharedFilePicker> = Lazy::new(SharedFilePicker::default);
 pub static FRECENCY: Lazy<SharedFrecency> = Lazy::new(SharedFrecency::default);
 pub static QUERY_TRACKER: Lazy<SharedQueryTracker> = Lazy::new(SharedQueryTracker::default);
 
@@ -157,7 +157,10 @@ pub fn restart_index_in_path(_: &Lua, new_path: String) -> LuaResult<()> {
     // instantly; the internal reinit path also re-checks and no-ops if
     // the picker is already pointing at `canonical_path`.
     std::thread::spawn(move || {
-        ::tracing::info!(?canonical_path, "restart_index_in_path: spawned worker running");
+        ::tracing::info!(
+            ?canonical_path,
+            "restart_index_in_path: spawned worker running"
+        );
         {
             let guard = match FILE_PICKER.read() {
                 Ok(g) => g,
@@ -171,7 +174,10 @@ pub fn restart_index_in_path(_: &Lua, new_path: String) -> LuaResult<()> {
             }
         }
 
-        ::tracing::info!(?canonical_path, "restart_index_in_path: calling reinit_file_picker_internal");
+        ::tracing::info!(
+            ?canonical_path,
+            "restart_index_in_path: calling reinit_file_picker_internal"
+        );
         if let Err(e) = reinit_file_picker_internal(&canonical_path) {
             ::tracing::error!(
                 ?e,
@@ -449,7 +455,11 @@ pub fn track_access(_: &Lua, file_path: String) -> LuaResult<bool> {
             return;
         };
         if let Err(e) = picker.update_single_file_frecency(&file_path, frecency) {
-            ::tracing::debug!(?e, ?file_path, "track_access: update_single_file_frecency failed");
+            ::tracing::debug!(
+                ?e,
+                ?file_path,
+                "track_access: update_single_file_frecency failed"
+            );
         }
     });
 

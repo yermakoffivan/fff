@@ -7,47 +7,17 @@ use std::{
 };
 use tracing::debug;
 
-/// Canonical [`StatusOptions`] used by every git-status callsite.
-///
-/// Centralising this avoids the drift that previously existed between the
-/// initial-scan query, `refresh_git_status`, and `git_status_for_paths`
-/// (e.g. only some of them set `include_unmodified(true)`, which silently
-/// changed which files appeared in the returned cache).
-///
-/// Callers that need additional pathspec filtering should append to the
-/// returned value.
-pub fn default_status_options() -> StatusOptions {
+pub(crate) fn default_status_options() -> StatusOptions {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        // Ensures clean files explicitly appear in the cache so that a
-        // full-cache refresh can flip a previously-dirty file back to
-        // clean. Without this flag clean files are simply missing from
-        // the cache, which is ambiguous ("clean now" vs "not queried").
         .include_unmodified(true)
         .exclude_submodules(true);
     opts
 }
 
-/// Cache of a git-status query, keyed by **absolute path**.
-///
-/// Uses a hash map rather than a sorted `Vec` because:
-///   1. libgit2's sort order depends on the filesystem (case-insensitive
-///      on macOS APFS/HFS+, case-sensitive on Linux ext4) whereas
-///      `Path::cmp` is always byte-wise. A case-insensitive FS therefore
-///      broke the binary-search invariant that a sorted `Vec` requires.
-///   2. Lookups are effectively O(1) regardless of repo size, matching
-///      the amortised cost paid during a full-rescan apply pass over
-///      hundreds of thousands of files.
-///
-/// A missing key means "this path was not reported by git status" — it
-/// does NOT distinguish "clean" from "not in the cache at all". The
-/// canonical status options ([`default_status_options`]) set
-/// `include_unmodified(true)` so that clean files are still present with
-/// `Status::CURRENT`, making absence a true "libgit2 has never heard of
-/// this path" signal.
 #[derive(Debug, Clone, Default)]
-pub struct GitStatusCache(AHashMap<PathBuf, Status>);
+pub(crate) struct GitStatusCache(AHashMap<PathBuf, Status>);
 
 impl IntoIterator for GitStatusCache {
     type Item = (PathBuf, Status);

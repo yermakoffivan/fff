@@ -35,7 +35,7 @@ use fff::file_picker::FilePicker;
 use fff::frecency::FrecencyTracker;
 use fff::query_tracker::QueryTracker;
 use fff::{DbHealthChecker, FFFMode, FuzzySearchOptions, PaginationArgs, QueryParser};
-use fff::{SharedFrecency, SharedPicker};
+use fff::{SharedFilePicker, SharedFrecency};
 use ffi_types::{
     FffDirItem, FffDirSearchResult, FffFileItem, FffGrepMatch, FffGrepResult, FffMixedItem,
     FffMixedSearchResult, FffResult, FffScanProgress, FffScore, FffSearchResult,
@@ -46,7 +46,7 @@ use ffi_types::{
 /// The caller receives this as `*mut c_void` and must pass it to every FFI call.
 /// The fff_handle is freed by `fff_destroy`.
 struct FffInstance {
-    picker: SharedPicker,
+    picker: SharedFilePicker,
     frecency: SharedFrecency,
     query_tracker: SharedQueryTracker,
 }
@@ -204,7 +204,7 @@ pub unsafe extern "C" fn fff_create_instance2(
     let history_path = unsafe { optional_cstr(history_db_path) }.map(|s| s.to_string());
 
     // Create shared state that background threads will write into.
-    let shared_picker = SharedPicker::default();
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
     let query_tracker = SharedQueryTracker::default();
 

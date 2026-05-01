@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, Instant};
 
 use crate::error::Error;
@@ -37,35 +37,64 @@ fn wait_for_git_index_lock_release(git_root: &Path) {
 }
 
 /// Thread-safe shared handle to the [`FilePicker`] instance.
-///
-/// Uses `parking_lot::RwLock` which is reader-fair — new readers are not
-/// blocked when a writer is waiting, preventing search query stalls during
-/// background bigram builds or watcher writes.
-///
-/// `Clone` gives a new handle to the same picker (Arc clone).
-/// `Default` creates an empty handle suitable for `Lazy::new(SharedPicker::default)`.
+/// This is a main thread-safe primitive to use FFF file picker,
+/// will automatically clean all the background work on drop.
 #[derive(Clone, Default)]
-pub struct SharedPicker(pub(crate) Arc<parking_lot::RwLock<Option<FilePicker>>>);
+pub struct SharedFilePicker(pub(crate) Arc<SharedPickerInner>);
 
-impl std::fmt::Debug for SharedPicker {
+pub struct SharedPickerInner {
+    picker: parking_lot::RwLock<Option<FilePicker>>,
+}
+
+impl Default for SharedPickerInner {
+    fn default() -> Self {
+        Self {
+            picker: parking_lot::RwLock::new(None),
+        }
+    }
+}
+
+/// Non-owning handle to a [`SharedPicker`].
+#[derive(Clone)]
+pub(crate) struct WeakFilePicker(Weak<SharedPickerInner>);
+
+impl WeakFilePicker {
+    /// Try to promote the weak handle back to a strong [`SharedPicker`].
+    ///
+    /// Returns `None` once every strong `SharedPicker` clone has been
+    /// dropped. Callers should treat that as "the picker is being
+    /// torn down" and exit their current iteration cleanly.
+    pub(crate) fn upgrade(&self) -> Option<SharedFilePicker> {
+        self.0.upgrade().map(SharedFilePicker)
+    }
+}
+
+impl std::fmt::Debug for SharedFilePicker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("SharedPicker").field(&"..").finish()
     }
 }
 
-impl SharedPicker {
+impl SharedFilePicker {
     pub fn read(&self) -> Result<parking_lot::RwLockReadGuard<'_, Option<FilePicker>>, Error> {
-        Ok(self.0.read())
+        Ok(self.0.picker.read())
     }
 
     pub fn write(&self) -> Result<parking_lot::RwLockWriteGuard<'_, Option<FilePicker>>, Error> {
-        Ok(self.0.write())
+        Ok(self.0.picker.write())
+    }
+
+    /// Produce a non-owning handle to the same inner picker. Held by
+    /// internal threads (e.g. the background watcher's owner) so they
+    /// don't extend the picker's lifetime.
+    pub(crate) fn downgrade(&self) -> WeakFilePicker {
+        WeakFilePicker(Arc::downgrade(&self.0))
     }
 
     /// Return `true` if this is an instance of the picker that requires a complicated post-scan
     /// indexing/cache warmup job. The indexing is not crazy but it takes time.
     pub fn need_complex_rebuild(&self) -> bool {
-        let guard = self.0.read();
+        let guard = self.0.picker.read();
         guard
             .as_ref()
             .is_some_and(|p| p.need_enable_mmap_cache() || p.need_enable_content_indexing())
@@ -75,7 +104,7 @@ impl SharedPicker {
     /// Returns `true` if scan completed, `false` on timeout.
     pub fn wait_for_scan(&self, timeout: Duration) -> bool {
         let signal = {
-            let guard = self.0.read();
+            let guard = self.0.picker.read();
             match &*guard {
                 Some(picker) => picker.scan_signal(),
                 None => return true,
@@ -96,7 +125,7 @@ impl SharedPicker {
     /// Returns `true` if watcher ready, `false` on timeout.
     pub fn wait_for_watcher(&self, timeout: Duration) -> bool {
         let signal = {
-            let guard = self.0.read();
+            let guard = self.0.picker.read();
             match &*guard {
                 Some(picker) => picker.watcher_signal(),
                 None => return true,

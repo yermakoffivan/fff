@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 use fff_search::file_picker::{FFFMode, FilePicker};
 use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
-use fff_search::{FilePickerOptions, SharedFrecency, SharedPicker};
+use fff_search::{FilePickerOptions, SharedFilePicker, SharedFrecency};
 
 /// Create a temp directory with some initial files, run the full picker lifecycle,
 /// then modify a file and verify grep finds the new content.
@@ -25,7 +25,7 @@ fn modified_file_findable_via_overlay() {
     .unwrap();
     fs::write(base.join("gamma.txt"), "yet another file\nmore lines\n").unwrap();
 
-    let shared_picker = SharedPicker::default();
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
 
     FilePicker::new_with_shared_state(
@@ -175,7 +175,7 @@ fn deleted_file_excluded_via_overlay() {
     fs::write(base.join("keep.txt"), "keep this content\n").unwrap();
     fs::write(base.join("remove.txt"), "DELETEME_TOKEN is here\n").unwrap();
 
-    let shared_picker = SharedPicker::default();
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
 
     FilePicker::new_with_shared_state(
@@ -244,7 +244,7 @@ fn new_file_findable_after_add() {
 
     fs::write(base.join("existing.txt"), "original content\n").unwrap();
 
-    let shared_picker = SharedPicker::default();
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
 
     FilePicker::new_with_shared_state(
@@ -314,7 +314,7 @@ fn modified_file_findable_via_regex_overlay() {
     )
     .unwrap();
 
-    let shared_picker = SharedPicker::default();
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
 
     FilePicker::new_with_shared_state(
@@ -397,7 +397,7 @@ fn grep_for<'a>(picker: &'a FilePicker, query: &str) -> fff_search::grep::GrepRe
     picker.grep(&parsed, &grep_opts())
 }
 
-fn wait_for_bigram(shared_picker: &SharedPicker) {
+fn wait_for_bigram(shared_picker: &SharedFilePicker) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         std::thread::sleep(Duration::from_millis(50));

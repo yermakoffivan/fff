@@ -33,7 +33,7 @@ use crate::bigram_filter::BigramOverlay;
 use crate::bigram_filter::build_bigram_index;
 use crate::error::Error;
 use crate::file_picker::{self, FFFMode, warmup_mmaps};
-use crate::shared::{SharedFrecency, SharedPicker};
+use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::types::ContentCacheBudget;
 
 /// Shared atomic flags surfaced by the picker for the scan worker to
@@ -79,7 +79,7 @@ pub(crate) struct ScanConfig {
 /// current `FilePicker`) or [`ScanJob::initial`] (for the bootstrap
 /// scan, before the picker is published to `SharedPicker`).
 pub(crate) struct ScanJob {
-    shared_picker: SharedPicker,
+    shared_picker: SharedFilePicker,
     shared_frecency: SharedFrecency,
     base_path: PathBuf,
     mode: FFFMode,
@@ -93,7 +93,7 @@ pub(crate) struct ScanJob {
 
 impl ScanJob {
     pub fn new(
-        shared_picker: &SharedPicker,
+        shared_picker: &SharedFilePicker,
         shared_frecency: &SharedFrecency,
         install_watcher: bool,
     ) -> Result<Option<Self>, Error> {
@@ -131,7 +131,7 @@ impl ScanJob {
     /// bootstrap scan before the `FilePicker` is published to
     /// `SharedPicker`.
     pub fn new_initial(
-        shared_picker: SharedPicker,
+        shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         base_path: PathBuf,
         mode: FFFMode,
@@ -211,6 +211,12 @@ impl ScanJob {
         // optional post-scan steps in the background.
         signals.scanning.store(false, Ordering::Relaxed);
 
+        // in case we do a rescan, we have to resubscribe a watcher to the new set of directories
+        // all the already watched directories are not going to be resubscribed
+        if !config.install_watcher && !signals.cancelled.load(Ordering::Acquire) {
+            resubscribe_to_new_picker(&shared_picker);
+        }
+
         // 3. Apply git status + frecency off-lock.
         if !signals.cancelled.load(Ordering::Acquire) {
             file_picker::apply_git_status_and_frecency(
@@ -223,9 +229,10 @@ impl ScanJob {
 
         // 4. Install filesystem watcher (initial scan only).
         if config.install_watcher && config.watch && !signals.cancelled.load(Ordering::Acquire) {
-            let shared_picker: &SharedPicker = &shared_picker;
+            let shared_picker: &SharedFilePicker = &shared_picker;
             let shared_frecency: &SharedFrecency = &shared_frecency;
             let base_path: &std::path::Path = &base_path;
+
             match BackgroundWatcher::new(
                 base_path.to_path_buf(),
                 git_workdir,
@@ -237,7 +244,7 @@ impl ScanJob {
                     if let Ok(mut guard) = shared_picker.write()
                         && let Some(picker) = guard.as_mut()
                     {
-                        picker.install_background_watcher(watcher);
+                        picker.background_watcher = Some(watcher);
                     }
                 }
                 Err(e) => error!(?e, "failed to initialize background watcher"),
@@ -258,9 +265,6 @@ impl ScanJob {
         // consume the flag with `swap` so concurrent requests that land
         // between the check and the follow-up spawn are still captured
         // by the next invocation.
-        //
-        // The follow-up deliberately passes `install_watcher=false` —
-        // watcher installation is a bootstrap-only concern.
         if !signals.cancelled.load(Ordering::Acquire)
             && signals.rescan_pending.swap(false, Ordering::AcqRel)
         {
@@ -312,13 +316,11 @@ impl Drop for ScanningGuard<'_> {
 }
 
 fn run_post_scan(
-    shared_picker: &SharedPicker,
+    shared_picker: &SharedFilePicker,
     base_path: &std::path::Path,
     signals: &ScanSignals,
     config: &ScanConfig,
 ) {
-    signals.post_scan_busy.store(true, Ordering::Release);
-    let _busy = PostScanBusyGuard(&signals.post_scan_busy);
     let phase_start = std::time::Instant::now();
 
     // Auto-scale the cache budget before we take the files snapshot —
@@ -333,12 +335,10 @@ fn run_post_scan(
         picker.set_cache_budget(ContentCacheBudget::new_for_repo(files.len()));
     }
 
-    // SAFETY: `post_scan_busy` blocks concurrent rescans from replacing
-    // `sync_data` for the lifetime of the raw slice below.
-    let Some((files, indexable_count, budget, arena)) = shared_picker
+    let Some((files, indexable_count, budget, arena, _busy_guard)) = shared_picker
         .read()
         .ok()
-        .and_then(|guard| guard.as_ref().map(snapshot_sync_data))
+        .and_then(|guard| guard.as_ref().map(|p| snapshot_sync_data(p, signals)))
     else {
         return;
     };
@@ -386,16 +386,49 @@ impl Drop for PostScanBusyGuard<'_> {
     }
 }
 
-/// SAFETY: caller must hold `post_scan_busy` so `sync_data` isn't
-/// replaced while the returned slice is alive.
-fn snapshot_sync_data(
+/// Re-registers all the directories at the watcher
+#[tracing::instrument(skip_all)]
+fn resubscribe_to_new_picker(shared_picker: &SharedFilePicker) {
+    let Ok(guard) = shared_picker.read() else {
+        return;
+    };
+    let Some(picker) = guard.as_ref() else {
+        return;
+    };
+    let Some(watcher) = picker.background_watcher_ref() else {
+        return;
+    };
+
+    // Base path first — this is the watch that delivers `Create(Folder)`
+    // events for brand-new top-level subdirs. On rescan paths this
+    // watch is still alive (the BackgroundWatcher survives rescans), so
+    // the call is idempotent. Including it explicitly protects against
+    // any future refactor that could drop the initial base-path watch.
+    watcher.request_watch_dir(picker.base_path().to_path_buf());
+
+    picker.for_each_dir(|dir: &std::path::Path| {
+        watcher.request_watch_dir(dir.to_path_buf());
+        std::ops::ControlFlow::Continue(())
+    });
+}
+
+/// Take a `'static`-lifetime snapshot of `sync_data` pinned by a
+/// post-scan busy guard. Concurrent rescans short-circuit while the
+/// returned guard is alive, so the raw slice can't be freed from under
+/// the warmup + bigram build that consumes it.
+fn snapshot_sync_data<'a>(
     picker: &crate::file_picker::FilePicker,
+    signals: &'a ScanSignals,
 ) -> (
     &'static [crate::types::FileItem],
     usize,
     Arc<ContentCacheBudget>,
     crate::simd_path::ArenaPtr,
+    PostScanBusyGuard<'a>,
 ) {
+    signals.post_scan_busy.store(true, Ordering::Release);
+    let busy = PostScanBusyGuard(&signals.post_scan_busy);
+
     let (files, indexable_count, arena) = picker.sync_data_snapshot();
     let ptr = files.as_ptr();
     let len = files.len();
@@ -406,5 +439,6 @@ fn snapshot_sync_data(
         indexable_count,
         picker.cache_budget_arc(),
         arena,
+        busy,
     )
 }

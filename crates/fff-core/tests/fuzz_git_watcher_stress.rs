@@ -58,8 +58,8 @@
 use fff_search::file_picker::{FFFMode, FilePicker};
 use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
 use fff_search::{
-    FilePickerOptions, FuzzySearchOptions, PaginationArgs, QueryParser, SharedFrecency,
-    SharedPicker,
+    FilePickerOptions, FuzzySearchOptions, PaginationArgs, QueryParser, SharedFilePicker,
+    SharedFrecency,
 };
 use git2::{Repository, Status, StatusOptions};
 use proptest::prelude::*;
@@ -253,10 +253,7 @@ fn stress_seeded() {
     let seed = parse_stress_seed();
     let seed_bytes = expand_u64_seed(seed);
 
-    eprintln!(
-        "stress_seeded: using deterministic seed {seed:#018x} \
-         (override via FFF_STRESS_SEED=<u64|0xHEX>)"
-    );
+    eprintln!("stress_seeded: using deterministic seed {seed:#018x}");
 
     let mut config = proptest_config();
     // The seeded run should never write to the shared regressions file —
@@ -541,7 +538,7 @@ fn apply_op(op: &AbstractOp, base: &Path, live: &mut [Live]) {
 ///
 /// On timeout, returns an `Err` describing every disagreement.
 fn converge_git_status(
-    shared_picker: &SharedPicker,
+    shared_picker: &SharedFilePicker,
     base: &Path,
     live: &[Live],
 ) -> Result<(), String> {
@@ -618,7 +615,7 @@ fn read_truth_status(base: &Path) -> BTreeMap<String, Status> {
     out
 }
 
-fn read_picker_status(shared: &SharedPicker) -> BTreeMap<String, Option<Status>> {
+fn read_picker_status(shared: &SharedFilePicker) -> BTreeMap<String, Option<Status>> {
     let guard = shared.read().expect("picker read lock");
     let picker = guard.as_ref().expect("picker initialized");
 
@@ -657,7 +654,7 @@ fn read_picker_status(shared: &SharedPicker) -> BTreeMap<String, Option<Status>>
 /// its status, or `None` if the file is not findable. Used for diagnostics
 /// when the top-level enumeration reports a disagreement — confirms that
 /// the mismatch reproduces via the exact user-facing lookup path.
-fn probe_single_file_status(shared: &SharedPicker, relative: &str) -> Option<Option<Status>> {
+fn probe_single_file_status(shared: &SharedFilePicker, relative: &str) -> Option<Option<Status>> {
     let guard = shared.read().ok()?;
     let picker = guard.as_ref()?;
     let parser = QueryParser::default();
@@ -735,7 +732,7 @@ fn stem_for_query(relative: &str) -> String {
 
 /// Run a one-shot fuzzy_search and return the matched items' relative
 /// paths paired with their `git_status`. Uses only public APIs.
-fn fuzzy_search_items(shared: &SharedPicker, query: &str) -> Vec<(String, Option<Status>)> {
+fn fuzzy_search_items(shared: &SharedFilePicker, query: &str) -> Vec<(String, Option<Status>)> {
     let guard = match shared.read() {
         Ok(g) => g,
         Err(_) => return Vec::new(),
@@ -767,7 +764,7 @@ fn fuzzy_search_items(shared: &SharedPicker, query: &str) -> Vec<(String, Option
 /// Run live grep (plain-text mode) and return the unique set of matched
 /// file paths. A file appears in the set iff at least one line inside it
 /// matches the query. Uses only public APIs.
-fn grep_plain_matches(shared: &SharedPicker, query: &str) -> Vec<String> {
+fn grep_plain_matches(shared: &SharedFilePicker, query: &str) -> Vec<String> {
     let guard = match shared.read() {
         Ok(g) => g,
         Err(_) => return Vec::new(),
@@ -793,7 +790,11 @@ fn grep_plain_matches(shared: &SharedPicker, query: &str) -> Vec<String> {
     let result = picker.grep(&parsed, &opts);
     // `GrepResult::files` is the already-deduplicated list of files that
     // contained at least one match — exactly what we want.
-    result.files.iter().map(|f| f.relative_path(picker)).collect()
+    result
+        .files
+        .iter()
+        .map(|f| f.relative_path(picker))
+        .collect()
 }
 
 /// Report from [`probe_real_queries`]. `None` means "nothing to probe this
@@ -810,7 +811,7 @@ type ProbeOutcome = Option<Result<(), String>>;
 ///   * `None`         — nothing to probe (no live files).
 ///   * `Some(Ok(()))` — the probe agreed with truth on both surfaces.
 ///   * `Some(Err(s))` — diagnostic describing the disagreement.
-fn probe_real_queries(shared: &SharedPicker, live: &[Live]) -> ProbeOutcome {
+fn probe_real_queries(shared: &SharedFilePicker, live: &[Live]) -> ProbeOutcome {
     if live.is_empty() {
         return None;
     }
@@ -933,7 +934,7 @@ fn status_equivalent(truth: Status, picker: Option<Status>) -> bool {
     truth == picker_bits
 }
 
-fn format_mismatches(mismatches: &[Mismatch], shared: &SharedPicker) -> String {
+fn format_mismatches(mismatches: &[Mismatch], shared: &SharedFilePicker) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "{} mismatch(es) after {} of wait:\n",
@@ -1046,8 +1047,8 @@ fn content_for(seed: u32, name: &str) -> String {
     )
 }
 
-fn start_watched_picker(base: &Path) -> (SharedPicker, SharedFrecency) {
-    let shared_picker = SharedPicker::default();
+fn start_watched_picker(base: &Path) -> (SharedFilePicker, SharedFrecency) {
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::noop();
 
     FilePicker::new_with_shared_state(
@@ -1067,7 +1068,7 @@ fn start_watched_picker(base: &Path) -> (SharedPicker, SharedFrecency) {
     (shared_picker, shared_frecency)
 }
 
-fn wait_ready(p: &SharedPicker) {
+fn wait_ready(p: &SharedFilePicker) {
     assert!(
         p.wait_for_scan(Duration::from_secs(15)),
         "timed out waiting for initial scan"
@@ -1196,7 +1197,10 @@ fn stress_merge_conflict_convergence() {
     )
     .unwrap();
     git(&base, &["add", "conflict.rs"]);
-    git(&base, &["commit", "-m", "feature: rewrite", "--no-gpg-sign"]);
+    git(
+        &base,
+        &["commit", "-m", "feature: rewrite", "--no-gpg-sign"],
+    );
 
     std::thread::sleep(Duration::from_millis(1100));
     git(&base, &["checkout", "main"]);
@@ -1219,9 +1223,7 @@ fn stress_merge_conflict_convergence() {
         "conflict.rs",
         |s| {
             // Post-commit: should be clean (CURRENT or None = no row).
-            s.is_none()
-                || s.unwrap().is_empty()
-                || s.unwrap().contains(Status::CURRENT)
+            s.is_none() || s.unwrap().is_empty() || s.unwrap().contains(Status::CURRENT)
         },
         Duration::from_secs(10),
         "pre-merge clean",
@@ -1313,11 +1315,7 @@ fn stress_merge_conflict_convergence() {
         &shared_picker,
         &base,
         "conflict.rs",
-        |s| {
-            s.is_none()
-                || s.unwrap().is_empty()
-                || s.unwrap().contains(Status::CURRENT)
-        },
+        |s| s.is_none() || s.unwrap().is_empty() || s.unwrap().contains(Status::CURRENT),
         CONFLICT_CONVERGE_TIMEOUT,
         "CURRENT after resolve",
     )
@@ -1381,7 +1379,7 @@ fn seed_conflict_repo(base: &Path) {
 /// `git_status`, or the timeout expires. On expiry returns an `Err` with
 /// the last observed status + truth status for diagnostics.
 fn expect_file_status(
-    shared: &SharedPicker,
+    shared: &SharedFilePicker,
     base: &Path,
     relative: &str,
     predicate: impl Fn(Option<Status>) -> bool,

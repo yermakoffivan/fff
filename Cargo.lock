@@ -667,14 +667,15 @@ dependencies = [
 
 [[package]]
 name = "fff-notify-debouncer-full"
-version = "0.9.1"
+version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4594f0ef1ad0bfcd112bbe4b397ef881f50442bc710356b86858d555848e4d09"
+checksum = "5c6f0c16164d10c082af931377766f5495440bee66a9a841bbcea1af5de8878c"
 dependencies = [
  "file-id",
  "log",
- "notify 9.0.0-rc.3",
+ "notify",
  "notify-types",
+ "rustc-hash 2.1.2",
  "walkdir",
 ]
 
@@ -688,6 +689,7 @@ dependencies = [
  "criterion",
  "ctrlc",
  "dirs",
+ "fff-notify-debouncer-full",
  "fff-query-parser",
  "fff-search",
  "git2",
@@ -697,9 +699,9 @@ dependencies = [
  "mimalloc",
  "mlua",
  "neo_frizbee",
- "notify 8.2.0",
- "notify-debouncer-full",
+ "notify",
  "once_cell",
+ "parking_lot",
  "pathdiff",
  "rand 0.8.5",
  "rayon",
@@ -745,7 +747,7 @@ dependencies = [
  "memmap2",
  "mimalloc",
  "neo_frizbee",
- "notify 9.0.0-rc.3",
+ "notify",
  "once_cell",
  "parking_lot",
  "pathdiff",
@@ -801,15 +803,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "fsevent-sys"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -1561,24 +1554,6 @@ dependencies = [
 
 [[package]]
 name = "notify"
-version = "8.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d3d07927151ff8575b7087f245456e549fea62edf0ec4e565a5ee50c8402bc3"
-dependencies = [
- "bitflags 2.11.0",
- "fsevent-sys",
- "inotify",
- "kqueue",
- "libc",
- "log",
- "mio",
- "notify-types",
- "walkdir",
- "windows-sys 0.60.2",
-]
-
-[[package]]
-name = "notify"
 version = "9.0.0-rc.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "783683ce6e1059e3747190a6c05688db21e07a846bf90babb351365f9133fe3e"
@@ -1595,19 +1570,6 @@ dependencies = [
  "walkdir",
  "windows-sys 0.61.2",
  "xxhash-rust",
-]
-
-[[package]]
-name = "notify-debouncer-full"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "375bd3a138be7bfeff3480e4a623df4cbfb55b79df617c055cd810ba466fa078"
-dependencies = [
- "file-id",
- "log",
- "notify 8.2.0",
- "notify-types",
- "walkdir",
 ]
 
 [[package]]
@@ -2861,7 +2823,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

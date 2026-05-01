@@ -1,15 +1,15 @@
 use crate::error::Error;
 use crate::file_picker::{FFFMode, FilePicker};
 use crate::git::GitStatusCache;
-use crate::shared::{SharedFrecency, SharedPicker};
+use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
 use git2::Repository;
 use notify::event::{AccessKind, AccessMode};
 use notify::{Config, EventKind, EventKindMask, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 use tracing::{Level, debug, error, info, warn};
@@ -18,20 +18,9 @@ type Debouncer = notify_debouncer_full::Debouncer<notify::RecommendedWatcher, No
 
 /// Owns the file-system watcher and guarantees that all background threads
 /// are fully joined before `stop()` / `Drop` returns.
-///
-/// Architecture:
-///   - The debouncer (and its internal watcher) live inside an **owner thread**
-///     that we spawn and hold the `JoinHandle` for.
-///   - `stop()` sets a flag, unparks the owner thread, and **joins** it.
-///   - Inside the owner thread, `Debouncer::stop()` is called which joins the
-///     debouncer's event-processing thread.
-///   - On Windows an additional short sleep is added after `Debouncer::stop()`
-///     because `notify`'s `ReadDirectoryChangesWatcher` discards its thread
-///     `JoinHandle`, so we cannot join it directly. The watcher's `Drop` does
-///     signal the thread via semaphore so it exits almost immediately, but we
-///     need to give the OS a moment to reclaim it.
 pub struct BackgroundWatcher {
-    stop_signal: Arc<AtomicBool>,
+    debouncer: Arc<Mutex<Option<Debouncer>>>,
+    watch_tx: Option<mpsc::Sender<PathBuf>>,
     owner_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -50,7 +39,7 @@ impl BackgroundWatcher {
     pub fn new(
         base_path: PathBuf,
         git_workdir: Option<PathBuf>,
-        shared_picker: SharedPicker,
+        shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         mode: FFFMode,
     ) -> Result<Self, Error> {
@@ -85,10 +74,10 @@ impl BackgroundWatcher {
         let use_recursive = cfg!(target_os = "macos");
 
         let (watch_tx, watch_rx) = mpsc::channel::<PathBuf>();
+        let watch_tx_for_debouncer = watch_tx.clone();
 
-        // Clone shared state for the owner thread (needed for injecting
-        // files that existed before a watch was registered on their directory).
-        let owner_picker = shared_picker.clone();
+        let owner_weak_picker = shared_picker.downgrade();
+        let owner_frecency = shared_frecency.clone();
         let owner_git_workdir = git_workdir.clone();
 
         let debouncer = Self::create_debouncer(
@@ -98,56 +87,43 @@ impl BackgroundWatcher {
             shared_frecency,
             mode,
             use_recursive,
-            watch_tx,
+            watch_tx_for_debouncer,
         )?;
 
         info!("Background file watcher initialized successfully");
-        let stop_signal = Arc::new(AtomicBool::new(false));
-        let stop_clone = Arc::clone(&stop_signal);
 
-        // The owner thread keeps the debouncer alive and ensures proper
-        // cleanup: `Debouncer::stop()` joins its internal thread, then the
-        // watcher `Drop` signals its I/O thread to exit.
+        // debouncer is shared with the owner thread, once it's dropped the thread is closed
+        let debouncer = Arc::new(Mutex::new(Some(debouncer)));
+        let owner_debouncer = Arc::clone(&debouncer);
+
         let owner_thread = std::thread::Builder::new()
-            .name("fff-watcher-owner".into())
+            .name("fff-watcher-own".into())
             .spawn(move || {
-                let mut debouncer = debouncer;
-                while !stop_clone.load(Ordering::Acquire) {
-                    // Process pending watch requests from the event handler
-                    // (new directories that need to be watched).
-                    while let Ok(dir) = watch_rx.try_recv() {
-                        match debouncer.watch(dir.as_path(), RecursiveMode::NonRecursive) {
-                            Ok(()) => {
-                                debug!("Added watch for new directory: {}", dir.display());
-                            }
-                            Err(e) => {
-                                warn!("Failed to watch new directory {}: {}", dir.display(), e);
-                            }
-                        }
+                while let Ok(dir) = watch_rx.recv() {
+                    // if the picker is dropped we do need to exit the loop
+                    let Some(strong_picker) = owner_weak_picker.upgrade() else {
+                        break;
+                    };
 
-                        // Files created before the watch was registered don't
-                        // generate events. Do a flat (non-recursive) read_dir
-                        // to inject any files that already exist. Subdirectories
-                        // are not descended — they get their own watches via
-                        // future Create events from this directory's watch.
-                        inject_existing_files(&dir, &owner_picker, &owner_git_workdir);
+                    if let Some(debouncer) = owner_debouncer.lock().as_mut() {
+                        process_watch_request(
+                            debouncer,
+                            &dir,
+                            &strong_picker,
+                            &owner_frecency,
+                            &owner_git_workdir,
+                        );
                     }
-                    std::thread::park_timeout(Duration::from_secs(1));
+
+                    // Transient strong ref drops here, back
+                    // to weak-only before the next `recv()`.
                 }
-                // Debouncer::stop() joins the debouncer's event thread, then
-                // drops the watcher (whose Drop signals the I/O thread).
-                debouncer.stop();
-                // On Windows the notify crate discards the ReadDirectoryChangesW
-                // thread's JoinHandle — we cannot join it. Its Drop signals the
-                // thread via semaphore so it exits almost immediately; give the
-                // OS a moment to fully reclaim it.
-                #[cfg(windows)]
-                std::thread::sleep(Duration::from_millis(250));
             })
             .expect("failed to spawn fff-watcher-owner thread");
 
         Ok(Self {
-            stop_signal,
+            debouncer,
+            watch_tx: Some(watch_tx),
             owner_thread: Some(owner_thread),
         })
     }
@@ -155,7 +131,7 @@ impl BackgroundWatcher {
     fn create_debouncer(
         base_path: PathBuf,
         git_workdir: Option<PathBuf>,
-        shared_picker: SharedPicker,
+        shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         mode: FFFMode,
         use_recursive: bool,
@@ -172,18 +148,33 @@ impl BackgroundWatcher {
 
         // `use_recursive` was decided by the caller from a cheap size hint,
         // so the event-handler closure can capture it directly.
+        //
+        // The closure lives on the debouncer's internal event thread
+        // for as long as the debouncer exists — i.e. the full
+        // lifetime of `BackgroundWatcher`. Capturing a strong
+        // `SharedFilePicker` here would re-introduce the Arc cycle
+        // we just broke with `owner_picker`'s `downgrade()` above.
+        // Capture a weak handle instead and upgrade per-batch.
         let git_workdir_for_handler = git_workdir.clone();
         let shared_picker_for_watching = shared_picker.clone();
+        let event_picker = shared_picker.downgrade();
         let mut debouncer = new_debouncer_opt(
             DEBOUNCE_TIMEOUT,
             Some(DEBOUNCE_TIMEOUT / 2), // tick rate for the event span
             {
                 move |result: DebounceEventResult| match result {
                     Ok(events) => {
+                        // Upgrade just long enough to drive one
+                        // debounced batch. Failure means every
+                        // external `SharedFilePicker` has already
+                        // dropped and teardown is already underway.
+                        let Some(strong_picker) = event_picker.upgrade() else {
+                            return;
+                        };
                         let new_dirs = handle_debounced_events(
                             events,
                             &git_workdir_for_handler,
-                            &shared_picker,
+                            &strong_picker,
                             &shared_frecency,
                             mode,
                         );
@@ -317,16 +308,45 @@ impl BackgroundWatcher {
     }
 
     pub fn stop(&mut self) {
-        self.stop_signal.store(true, Ordering::Release);
-        if let Some(handle) = self.owner_thread.take() {
-            handle.thread().unpark();
+        self.watch_tx.take();
+        if let Some(debouncer) = self.debouncer.lock().take() {
+            debouncer.stop();
+            // On Windows the notify crate discards the
+            // ReadDirectoryChangesW thread's JoinHandle — we can't
+            // join it directly. Its Drop posts a semaphore and the
+            // thread exits almost immediately; give the OS a moment
+            // to reclaim it.
+            #[cfg(windows)]
+            std::thread::sleep(Duration::from_millis(250));
+        }
 
-            if let Err(e) = handle.join() {
-                error!("Watcher owner thread panicked: {:?}", e);
-            }
+        // With both `Sender` clones dropped above, the owner thread's
+        // `watch_rx.recv()` returns `Err(Disconnected)` and it exits
+        // on its own. Join to make sure its stack (and the cheap
+        // `Arc<Shared*>` clones it owns) is fully reclaimed before
+        // we return.
+        if let Some(handle) = self.owner_thread.take()
+            && let Err(e) = handle.join()
+        {
+            error!("Watcher owner thread panicked: {:?}", e);
         }
 
         info!("Background file watcher stopped successfully");
+    }
+
+    /// Queue a non-recursive watch registration on `dir`.
+    ///
+    /// The owner thread is always blocked on `watch_rx.recv()`, so
+    /// the `send()` here wakes it immediately via the channel's
+    /// condvar — no external unpark needed.
+    ///
+    /// Returns `false` once `stop()` has dropped our `Sender` — any
+    /// further request is silently discarded.
+    pub(crate) fn request_watch_dir(&self, dir: PathBuf) -> bool {
+        match self.watch_tx.as_ref() {
+            Some(tx) => tx.send(dir).is_ok(),
+            None => false,
+        }
     }
 }
 
@@ -336,11 +356,31 @@ impl Drop for BackgroundWatcher {
     }
 }
 
+/// Handle a single `watch_rx` entry: register a non-recursive watch on
+/// the directory and inject any files that already exist inside it.
+///
+/// Extracted so both the `recv_timeout` wakeup branch and the inner
+/// `try_recv` drain loop in the owner thread share one implementation.
+fn process_watch_request(
+    debouncer: &mut Debouncer,
+    dir: &Path,
+    shared_picker: &SharedFilePicker,
+    shared_frecency: &SharedFrecency,
+    git_workdir: &Option<PathBuf>,
+) {
+    match debouncer.watch(dir, RecursiveMode::NonRecursive) {
+        Ok(()) => debug!("Added watch for new directory: {}", dir.display()),
+        Err(e) => warn!("Failed to watch new directory {}: {}", dir.display(), e),
+    }
+
+    track_files_from_new_directories(dir, shared_picker, shared_frecency, git_workdir);
+}
+
 #[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency), level = Level::DEBUG)]
 fn handle_debounced_events(
     events: Vec<DebouncedEvent>,
     git_workdir: &Option<PathBuf>,
-    shared_picker: &SharedPicker,
+    shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
     mode: FFFMode,
 ) -> Vec<PathBuf> {
@@ -656,7 +696,12 @@ fn handle_debounced_events(
 
 /// After registering a watch on a newly created directory, list its
 /// immediate children and add any files to the picker.
-fn inject_existing_files(dir: &Path, shared_picker: &SharedPicker, git_workdir: &Option<PathBuf>) {
+fn track_files_from_new_directories(
+    dir: &Path,
+    shared_picker: &SharedFilePicker,
+    shared_frecency: &SharedFrecency,
+    git_workdir: &Option<PathBuf>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -677,15 +722,36 @@ fn inject_existing_files(dir: &Path, shared_picker: &SharedPicker, git_workdir: 
         return;
     }
 
-    let Ok(mut guard) = shared_picker.write() else {
-        return;
-    };
-    let Some(ref mut picker) = *guard else {
-        return;
-    };
+    // brief read lock
+    {
+        let Ok(mut guard) = shared_picker.write() else {
+            return;
+        };
 
-    for path in &files_to_add {
-        picker.on_create_or_modify(path);
+        let Some(ref mut picker) = *guard else {
+            return;
+        };
+
+        for path in &files_to_add {
+            picker.on_create_or_modify(path);
+        }
+    }
+
+    if let Some(repo) = repo.as_ref() {
+        let status = match GitStatusCache::git_status_for_paths(repo, &files_to_add) {
+            Ok(status) => status,
+            Err(e) => {
+                tracing::error!(?e, "inject_existing_files: git status query failed");
+                return;
+            }
+        };
+
+        if let Ok(mut guard) = shared_picker.write()
+            && let Some(ref mut picker) = *guard
+            && let Err(e) = picker.update_git_statuses(status, shared_frecency)
+        {
+            error!("inject_existing_files: failed to update git statuses: {e:?}");
+        }
     }
 
     debug!(

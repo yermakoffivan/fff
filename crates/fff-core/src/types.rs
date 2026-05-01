@@ -458,6 +458,25 @@ impl FileItem {
         self.content = OnceLock::new();
     }
 
+    pub fn update_metadata(
+        &mut self,
+        budget: &ContentCacheBudget,
+        modified_secs: Option<u64>,
+        new_size: Option<u64>,
+    ) {
+        if let Some(modified) = modified_secs
+            && self.modified < modified
+        {
+            self.modified = modified;
+        }
+
+        self.invalidate_mmap(budget);
+
+        if let Some(size) = new_size {
+            self.size = size;
+        }
+    }
+
     /// Get the cached file contents or lazily load and cache them.
     ///
     /// Returns `None` if the file is too large, empty, can't be opened, **or

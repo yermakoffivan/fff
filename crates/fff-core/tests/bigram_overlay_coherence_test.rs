@@ -21,7 +21,9 @@ use tempfile::TempDir;
 
 use fff_search::file_picker::{FFFMode, FilePicker, FuzzySearchOptions};
 use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
-use fff_search::{FilePickerOptions, PaginationArgs, QueryParser, SharedFrecency, SharedPicker};
+use fff_search::{
+    FilePickerOptions, PaginationArgs, QueryParser, SharedFilePicker, SharedFrecency,
+};
 
 /// Stress test: 200 base files, 3 rounds of edits + deletes. New files
 /// are tracked but NOT verified via grep (see Group 3 for that bug).
@@ -502,10 +504,11 @@ fn bigram_overlay_coherence_mixed_tombstones_and_overflow() {
     }
 
     {
+        // assert
         let guard = shared_picker.read().unwrap();
         let picker = guard.as_ref().unwrap();
 
-        // Tombstones work: deleted tokens are gone.
+        // deleted tokens are gon
         for token in &deleted_tokens {
             assert_eq!(
                 grep_count(picker, token),
@@ -517,16 +520,16 @@ fn bigram_overlay_coherence_mixed_tombstones_and_overflow() {
         // Surviving base files still findable.
         for (name, token) in &repo_files[15..] {
             assert!(
-                grep_count(picker, token) >= 1,
+                grep_count(picker, token) == 1,
                 "surviving {name} token should be findable"
             );
         }
 
-        // BUG: Overflow files not findable via grep.
+        // New tokens needs to be findable
         for token in &new_tokens {
             assert!(
-                grep_count(picker, token) >= 1,
-                "BUG: overflow token {token} should be findable but bigram skips overflow"
+                grep_count(picker, token) == 1,
+                "BUG: overflow token {token} should be findable"
             );
         }
     }
@@ -1347,7 +1350,7 @@ fn grep_without_overlay_count(picker: &FilePicker, query: &str) -> usize {
 /// Wait for scanning to finish (no bigram requirement).
 /// Use after `trigger_rescan` which replaces sync_data but does not
 /// rebuild the bigram index.
-fn wait_for_scan(shared_picker: &SharedPicker) {
+fn wait_for_scan(shared_picker: &SharedFilePicker) {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         std::thread::sleep(Duration::from_millis(50));
@@ -1366,7 +1369,7 @@ fn wait_for_scan(shared_picker: &SharedPicker) {
     }
 }
 
-fn wait_for_bigram(shared_picker: &SharedPicker) {
+fn wait_for_bigram(shared_picker: &SharedFilePicker) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         std::thread::sleep(Duration::from_millis(50));
@@ -1389,7 +1392,7 @@ fn wait_for_bigram(shared_picker: &SharedPicker) {
     }
 }
 
-fn stop_picker(shared_picker: &SharedPicker) {
+fn stop_picker(shared_picker: &SharedFilePicker) {
     if let Ok(mut guard) = shared_picker.write() {
         if let Some(ref mut picker) = *guard {
             picker.stop_background_monitor();
@@ -1426,8 +1429,8 @@ fn git_add_and_commit(dir: &Path, msg: &str) {
     git_run(dir, &["commit", "-m", msg]);
 }
 
-fn make_picker(base: &Path) -> (SharedPicker, SharedFrecency) {
-    let shared_picker = SharedPicker::default();
+fn make_picker(base: &Path) -> (SharedFilePicker, SharedFrecency) {
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
 
     FilePicker::new_with_shared_state(

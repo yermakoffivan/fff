@@ -41,15 +41,6 @@ jobs:
 
   stress-test:
     name: Stress Test (Watcher + Git)
-    # Cross-platform: macOS uses FSEvents, Ubuntu uses inotify — different
-    # backends with different debouncer quirks and race windows, so
-    # running the same fuzz suite on both is the whole point. A job
-    # failure on either platform fails the CI gate.
-    #
-    # Matches the `test` job matrix above; Windows is not exercised
-    # anywhere else in CI, so wiring it up here would be asymmetric and
-    # would surface `ReadDirectoryChangesW`-specific noise without a
-    # corresponding signal. Add it when the rest of CI does.
     runs-on: ${{ matrix.os }}
     strategy:
       # Keep going after one OS fails so we can see whether a bug
