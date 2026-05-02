@@ -5,13 +5,7 @@ LIBDIR ?= $(PREFIX)/lib
 INCLUDEDIR ?= $(PREFIX)/include
 
 # Compile-time cfg that gates the watcher + git-status fuzz stress test.
-# Always set on `test-stress*` targets via RUSTFLAGS.
 STRESS_RUSTFLAGS := --cfg stress
-
-# Pinned seed for the deterministic stress run. Changing this value is
-# equivalent to picking a new regression surface, so keep it stable —
-# that's the whole point. Override ad-hoc on the command line via
-# `FFF_STRESS_SEED=<u64|0xhex> make test-stress-seeded`.
 FFF_STRESS_DEFAULT_SEED ?= 0xDEADBEEFCAFEBABE
 
 .PHONY: build build-c-lib install uninstall test test-rust test-lua test-version test-bun test-node prepare-bun prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random

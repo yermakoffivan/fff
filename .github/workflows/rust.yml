@@ -47,7 +47,7 @@ jobs:
       # reproduces everywhere or is platform-specific.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     # Long-running; don't let a stuck watcher thread burn a full CI
     # timeout. Two scenarios should finish well under this limit.
     timeout-minutes: 20
@@ -67,10 +67,6 @@ jobs:
           cache-key: "v1-rust-stress-${{ matrix.os }}"
           components: rustfmt, clippy
 
-      # Run 1: deterministic. Pins a regression surface that must not
-      # regress between builds. Seed is hard-coded in the Makefile; if
-      # you need to replay a different seed locally, prefix with
-      # `FFF_STRESS_SEED=<u64|0xHEX>`.
       - name: Stress test (seeded / deterministic)
         shell: bash
         run: make test-stress-seeded
@@ -79,12 +75,7 @@ jobs:
           FFF_STRESS_MIN_OPS: "30"
           FFF_STRESS_MAX_OPS: "50"
 
-      # Run 2: random. Every CI build explores a fresh slice of the op
-      # space. If this ever goes red, proptest persists the failing seed
-      # to `crates/fff-core/tests/fuzz_git_watcher_stress.proptest-regressions`;
-      # that file gets uploaded as an artifact so the failure is
-      # reproducible locally.
-      - name: Stress test (random / proptest)
+      - name: Stress test (random / fuzzy)
         shell: bash
         run: make test-stress-random
         env:

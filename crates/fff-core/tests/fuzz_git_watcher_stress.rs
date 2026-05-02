@@ -645,9 +645,19 @@ fn read_picker_status(shared: &SharedFilePicker) -> BTreeMap<String, Option<Stat
 
     let mut out = BTreeMap::new();
     for f in &result.items {
-        out.insert(f.relative_path(picker), f.git_status);
+        out.insert(normalize(f.relative_path(picker)), f.git_status);
     }
     out
+}
+
+fn normalize(s: String) -> String {
+    #[cfg(windows)]
+    {
+        if s.contains('\\') {
+            return s.replace('\\', "/");
+        }
+    }
+    s
 }
 
 /// Probe a single file by name via the public `fuzzy_search` API and return
@@ -674,7 +684,7 @@ fn probe_single_file_status(shared: &SharedFilePicker, relative: &str) -> Option
     result
         .items
         .iter()
-        .find(|f| f.relative_path(picker) == relative)
+        .find(|f| normalize(f.relative_path(picker)) == relative)
         .map(|f| f.git_status)
 }
 
@@ -757,7 +767,7 @@ fn fuzzy_search_items(shared: &SharedFilePicker, query: &str) -> Vec<(String, Op
     result
         .items
         .iter()
-        .map(|f| (f.relative_path(picker), f.git_status))
+        .map(|f| (normalize(f.relative_path(picker)), f.git_status))
         .collect()
 }
 
@@ -793,7 +803,7 @@ fn grep_plain_matches(shared: &SharedFilePicker, query: &str) -> Vec<String> {
     result
         .files
         .iter()
-        .map(|f| f.relative_path(picker))
+        .map(|f| normalize(f.relative_path(picker)))
         .collect()
 }
 

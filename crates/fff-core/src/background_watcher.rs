@@ -67,11 +67,17 @@ impl BackgroundWatcher {
         // and each failed `watch()` after the cap blocks ~40 ms on kernel retry.
         // Yes we pay for filtering events on handler phase but it is usable
         //
-        // Linux and windows uses per-dir NonRecursive mode: the notify crate's
-        // Recursive mode registers one inotify watch per subdir anyway
-        // (inotify itself is not recursive) this blows the amount of system watchers
-        // as every watcher has to be attached to exactly one folder/file.
-        let use_recursive = cfg!(target_os = "macos");
+        // macOS and Windows use a single recursive watch. FSEvents and
+        // ReadDirectoryChangesW both support true kernel-level recursion
+        // on one handle — per-dir NonRecursive watches burn streams/handles
+        // for no benefit and, on Windows, have been observed to silently
+        // drop Modify events for nested paths.
+        //
+        // Linux keeps the per-dir NonRecursive strategy: inotify has no
+        // kernel-level recursion, so Recursive here would still register
+        // one watch per subdir but without the ignored-dir filtering we
+        // get by iterating `picker.for_each_dir` ourselves.
+        let use_recursive = cfg!(any(target_os = "macos", target_os = "windows"));
 
         let (watch_tx, watch_rx) = mpsc::channel::<PathBuf>();
         let watch_tx_for_debouncer = watch_tx.clone();
@@ -118,6 +124,8 @@ impl BackgroundWatcher {
                     // Transient strong ref drops here, back
                     // to weak-only before the next `recv()`.
                 }
+
+                tracing::info!("Background watcher is stopped");
             })
             .expect("failed to spawn fff-watcher-owner thread");
 
@@ -171,6 +179,7 @@ impl BackgroundWatcher {
                         let Some(strong_picker) = event_picker.upgrade() else {
                             return;
                         };
+
                         let new_dirs = handle_debounced_events(
                             events,
                             &git_workdir_for_handler,
@@ -179,13 +188,10 @@ impl BackgroundWatcher {
                             mode,
                         );
 
-                        // In NonRecursive mode, register watches for newly
-                        // discovered directories so future file events in them
-                        // are captured. In Recursive mode the single stream
-                        // already covers new subdirectories.
-                        if !use_recursive {
-                            for dir in new_dirs {
-                                let _ = watch_tx.send(dir);
+                        // every new directory creates had to be reflected in the picker state
+                        for dir in new_dirs {
+                            if let Err(e) = watch_tx.send(dir) {
+                                warn!(?e, "Failed to send directory update error");
                             }
                         }
                     }
@@ -311,27 +317,11 @@ impl BackgroundWatcher {
         self.watch_tx.take();
         if let Some(debouncer) = self.debouncer.lock().take() {
             debouncer.stop();
-            // On Windows the notify crate discards the
-            // ReadDirectoryChangesW thread's JoinHandle — we can't
-            // join it directly. Its Drop posts a semaphore and the
-            // thread exits almost immediately; give the OS a moment
-            // to reclaim it.
-            #[cfg(windows)]
-            std::thread::sleep(Duration::from_millis(250));
         }
 
-        // With both `Sender` clones dropped above, the owner thread's
-        // `watch_rx.recv()` returns `Err(Disconnected)` and it exits
-        // on its own. Join to make sure its stack (and the cheap
-        // `Arc<Shared*>` clones it owns) is fully reclaimed before
-        // we return.
-        if let Some(handle) = self.owner_thread.take()
-            && let Err(e) = handle.join()
-        {
-            error!("Watcher owner thread panicked: {:?}", e);
-        }
+        self.owner_thread.take();
 
-        info!("Background file watcher stopped successfully");
+        info!("Background file watcher stop signaled");
     }
 
     /// Queue a non-recursive watch registration on `dir`.
@@ -368,9 +358,12 @@ fn process_watch_request(
     shared_frecency: &SharedFrecency,
     git_workdir: &Option<PathBuf>,
 ) {
-    match debouncer.watch(dir, RecursiveMode::NonRecursive) {
-        Ok(()) => debug!("Added watch for new directory: {}", dir.display()),
-        Err(e) => warn!("Failed to watch new directory {}: {}", dir.display(), e),
+    // macos uses a single watcher per file directory which is
+    if !cfg!(target_os = "macos") {
+        match debouncer.watch(dir, RecursiveMode::NonRecursive) {
+            Ok(()) => debug!("Added watch for new directory: {}", dir.display()),
+            Err(e) => warn!("Failed to watch new directory {}: {}", dir.display(), e),
+        }
     }
 
     track_files_from_new_directories(dir, shared_picker, shared_frecency, git_workdir);
