@@ -57,6 +57,7 @@ use std::sync::{
     Arc, LazyLock,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
+use std::thread::JoinHandle;
 use std::time::SystemTime;
 use tracing::{Level, debug, error, info, warn};
 
@@ -124,34 +125,17 @@ pub(crate) struct FileSync {
     pub(crate) git_workdir: Option<PathBuf>,
     /// Base files laid out in two partitions, each internally sorted by
     /// (parent_dir, filename):
-    ///   `files[..indexable_count]`        — bigram-indexable (text-by-ext,
-    ///                                        0 < size <= max_mmap_file_size)
-    ///   `files[indexable_count..base_count]` — known-unindexable (binary,
-    ///                                           zero-sized, or too large)
-    ///   `files[base_count..]`              — overflow (created since the
-    ///                                        last full reindex)
-    ///
-    /// The `indexable_count` split lets the bigram builder allocate column
-    /// bitsets sized to the eligible subset instead of the full base, saving
-    /// ~20% of peak RSS on directories with many non-code files.
+    ///   `files[..indexable_count]` - indexable
+    ///   `files[indexable_count..base_count]` - original-unindexable
+    ///   `files[base_count..]`— overflow (created on demand)
     files: Vec<FileItem>,
-    /// Number of bigram-indexable files at the head of `files`. Must satisfy
-    /// `indexable_count <= base_count <= files.len()`. Files at
-    /// `[..indexable_count]` are the only ones referenced by the bigram
-    /// inverted index.
     indexable_count: usize,
-    /// Number of base files (from the last full reindex). Overflow files
-    /// live at `files[base_count..]`, each with its own `ChunkedPathStore`
-    /// kept alive in `overflow_stores`.
     base_count: usize,
     /// Sorted directory table. Each entry is a unique parent directory of at
     /// least one file in `files`. Sorted by absolute path for O(log n) lookup.
-    /// Built during `walk_filesystem` and used for directory picker mode,
-    /// per-directory stats, and as a fast replacement for `extract_watch_dirs`.
     dirs: Vec<DirItem>,
     /// Shared builder for overflow file paths. Each overflow file's ChunkedString
-    /// uses `arena_override` pointing into this builder's arena. The builder
-    /// grows incrementally — no per-file store allocation. Dropped on rescan.
+    /// uses `arena_override` pointing into this builder's arena.
     overflow_builder: Option<crate::simd_path::ChunkedPathStoreBuilder>,
     /// Compressed bigram inverted index built during the post-scan phase.
     /// Lives here so that replacing `FileSync` on rescan automatically drops
@@ -295,11 +279,6 @@ impl FileSync {
             .map(|pos| self.base_count + pos)
     }
 
-    /// Insert a file at position. Simple - no HashMap to maintain!
-    fn insert_file(&mut self, position: usize, file: FileItem) {
-        self.files.insert(position, file);
-    }
-
     fn retain_files_with_arena<F>(&mut self, mut predicate: F) -> usize
     where
         F: FnMut(&FileItem, ArenaPtr) -> bool,
@@ -335,29 +314,6 @@ impl FileSync {
         self.indexable_count = indexable_retained;
         self.base_count = base_retained;
         initial_len - self.files.len()
-    }
-
-    /// Insert a file in sorted order (by path).
-    /// Returns true if inserted, false if file already exists.
-    ///
-    /// TODO: `find_file_index` no longer returns a meaningful insertion
-    /// point (`Err(0)` is a sentinel, not a binary-search bucket). This
-    /// function now always inserts at the end of the indexable partition.
-    /// It's only reachable via `add_file_sorted`, which is unused. If it
-    /// ever gets a caller, re-derive the insertion point explicitly.
-    fn insert_file_sorted(&mut self, file: FileItem, base_path: &Path) -> bool {
-        let arena = self.arena_base_ptr();
-        let abs_path = file.absolute_path(arena, base_path);
-        match self.find_file_index(&abs_path, base_path) {
-            Ok(_) => false, // File already exists
-            Err(_) => {
-                let position = self.indexable_count;
-                self.insert_file(position, file);
-                self.indexable_count += 1;
-                self.base_count += 1;
-                true
-            }
-        }
     }
 }
 
@@ -490,12 +446,12 @@ impl Default for FilePickerOptions {
 pub struct FilePicker {
     pub mode: FFFMode,
     pub base_path: PathBuf,
-    signals: ScanSignals,
     sync_data: FileSync,
+    pub(crate) signals: ScanSignals,
+    pub(crate) background_watcher: Option<BackgroundWatcher>,
     cache_budget: Arc<ContentCacheBudget>,
     has_explicit_cache_budget: bool,
     scanned_files_count: Arc<AtomicUsize>,
-    pub(crate) background_watcher: Option<BackgroundWatcher>,
     enable_mmap_cache: bool,
     enable_content_indexing: bool,
     watch: bool,
@@ -540,23 +496,15 @@ impl FilePicker {
         &self.base_path
     }
 
-    /// Convert an absolute path to a relative path string (relative to base_path).
-    /// Returns None if the path doesn't start with base_path.
-    fn to_relative_path<'a>(&self, path: &'a Path) -> Option<&'a str> {
-        path.strip_prefix(&self.base_path)
-            .ok()
-            .and_then(|p| p.to_str())
-    }
-
-    pub fn need_enable_mmap_cache(&self) -> bool {
+    pub fn has_mmap_cache(&self) -> bool {
         self.enable_mmap_cache
     }
 
-    pub fn need_enable_content_indexing(&self) -> bool {
+    pub fn has_content_indexing(&self) -> bool {
         self.enable_content_indexing
     }
 
-    pub fn need_watch(&self) -> bool {
+    pub fn has_watcher(&self) -> bool {
         self.watch
     }
 
@@ -580,11 +528,6 @@ impl FilePicker {
         self.sync_data.get_file_mut(index)
     }
 
-    pub fn set_bigram_index(&mut self, index: BigramFilter, overlay: BigramOverlay) {
-        self.sync_data.bigram_index = Some(Arc::new(index));
-        self.sync_data.bigram_overlay = Some(Arc::new(parking_lot::RwLock::new(overlay)));
-    }
-
     /// Absolute path to the repository root if the indexed tree lives
     /// inside a git working directory. `None` for non-git bases.
     pub fn git_root(&self) -> Option<&Path> {
@@ -597,55 +540,6 @@ impl FilePicker {
 
     pub fn set_cache_budget(&mut self, budget: ContentCacheBudget) {
         self.cache_budget = Arc::new(budget);
-    }
-
-    pub(crate) fn cache_budget_arc(&self) -> Arc<ContentCacheBudget> {
-        Arc::clone(&self.cache_budget)
-    }
-
-    /// Bundle the atomic flags the scan orchestrator needs. One method
-    /// instead of four separate getters so every callsite passes a
-    /// single `ScanSignals` value.
-    pub(crate) fn scan_signals(&self) -> crate::scan::ScanSignals {
-        crate::scan::ScanSignals {
-            scanning: Arc::clone(&self.signals.scanning),
-            watcher_ready: Arc::clone(&self.signals.watcher_ready),
-            cancelled: Arc::clone(&self.signals.cancelled),
-            post_scan_busy: Arc::clone(&self.signals.post_scan_busy),
-            rescan_pending: Arc::clone(&self.signals.rescan_pending),
-        }
-    }
-
-    /// Clone of the `scanned_files_count` atomic counter. The walker
-    /// bumps it per-file so the UI progress indicator can poll it via
-    /// `get_scan_progress` without holding any lock.
-    pub(crate) fn scanned_files_counter(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.scanned_files_count)
-    }
-
-    /// Reference to `sync_data.files()` exposed with arena base ptr and
-    /// `indexable_count` so the post-scan orchestrator can snapshot a
-    /// raw slice for off-lock work. SAFETY is upheld externally via
-    /// the `post_scan_busy` flag.
-    pub(crate) fn sync_data_snapshot(&self) -> (&[FileItem], usize, ArenaPtr) {
-        (
-            self.sync_data.files(),
-            self.sync_data.indexable_count,
-            self.sync_data.arena_base_ptr(),
-        )
-    }
-
-    /// Borrow the active background watcher, if one is installed.
-    ///
-    /// Used by the rescan orchestrator to re-register directory watches
-    /// after a `commit_new_sync` (see [`crate::scan::resync_watcher_dirs`]).
-    pub(crate) fn background_watcher_ref(&self) -> Option<&BackgroundWatcher> {
-        self.background_watcher.as_ref()
-    }
-
-    pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
-        self.sync_data = sync;
-        self.cache_budget.reset();
     }
 
     /// Get all indexed files sorted by path.
@@ -672,6 +566,7 @@ impl FilePicker {
             .chunked_paths
             .as_ref()
             .map_or(0, |s| s.heap_bytes());
+
         (chunked, 0, 0)
     }
 
@@ -765,17 +660,6 @@ impl FilePicker {
         }
     }
 
-    /// Lower bound on the number of directories `for_each_watch_dir` will
-    /// emit. Equals `sync_data.dirs.len()` — cheap to compute without the
-    /// walk. Used to decide between per-dir NonRecursive watches and a
-    /// single Recursive watch on macOS, where FSEvents streams are capped
-    /// per process. The true count can be slightly higher (pure-ancestor
-    /// dirs aren't in `sync_data.dirs`), but for any realistic repo the
-    /// gap is small compared to the threshold's headroom.
-    pub fn watch_dirs_count_hint(&self) -> usize {
-        self.sync_data.dirs.len()
-    }
-
     /// Create a new FilePicker from options.
     /// Always prefer new_with_shared_state for the consumer application, use this only if you know
     /// what you are doing. This won't spawn the backgraound watcher and won't walk the file tree.
@@ -789,6 +673,12 @@ impl FilePicker {
             error!("Refusing to index filesystem root: {}", path.display());
             return Err(Error::FilesystemRoot(path));
         }
+
+        // Windows-only: canonicalize with so the base path does NOT
+        // have the `\\?\` UNC prefix that `std::fs::canonicalize` adds.
+        // libgit2's `repo.workdir()`
+        #[cfg(windows)]
+        let path = crate::path_utils::canonicalize(&path).unwrap_or(path);
 
         let has_explicit_budget = options.cache_budget.is_some();
         let initial_budget = options.cache_budget.unwrap_or_default();
@@ -834,19 +724,15 @@ impl FilePicker {
         let scanned_files_counter = picker.scanned_files_counter();
         let path = picker.base_path.clone();
 
-        // Flip scanning=true *before* we publish the picker and spawn
-        // the worker, so any caller that calls `wait_for_scan`
-        // immediately after `new_with_shared_state` sees the scan as
-        // in-progress. Otherwise the waiter can poll between publish
-        // and worker-start, see `false`, and return early before any
-        // file has been indexed.
-        signals.scanning.store(true, Ordering::Release);
-
         {
             let mut guard = shared_picker.write()?;
             *guard = Some(picker);
         }
 
+        // `ScanJob::spawn` flips `scanning=true` synchronously before handing
+        // off to the worker thread, so callers that invoke `wait_for_scan`
+        // immediately after `new_with_shared_state` are guaranteed to see
+        // the scan in progress.
         ScanJob::new_initial(
             shared_picker,
             shared_frecency,
@@ -879,15 +765,19 @@ impl FilePicker {
         self.signals.scanning.store(true, Ordering::Relaxed);
         self.scanned_files_count.store(0, Ordering::Relaxed);
 
+        let git_workdir = FileSync::discover_git_workdir(&self.base_path);
+        let git_handle = git_workdir.clone().map(FileSync::spawn_git_status);
+
         let empty_frecency = SharedFrecency::default();
-        let walk = walk_filesystem(
+        let sync = FileSync::walk_filesystem(
             &self.base_path,
+            git_workdir,
             &self.scanned_files_count,
             &empty_frecency,
             self.mode,
         )?;
 
-        self.sync_data = walk.sync;
+        self.sync_data = sync;
 
         // Recalculate cache budget based on actual file count (unless
         // the caller provided an explicit budget via FilePickerOptions).
@@ -899,7 +789,9 @@ impl FilePicker {
         }
 
         // Apply git status synchronously.
-        if let Ok(Some(git_cache)) = walk.git_handle.join() {
+        if let Some(handle) = git_handle
+            && let Ok(Some(git_cache)) = handle.join()
+        {
             let arena = self.arena_base_ptr();
             for file in self.sync_data.files.iter_mut() {
                 file.git_status =
@@ -938,9 +830,7 @@ impl FilePicker {
     ///
     /// The query should be parsed using [`FFFQuery`]::parse() before calling
     /// this function. If a [`QueryTracker`] is provided, the search will
-    /// automatically look up the last selected file for this query and apply
-    /// combo-boost scoring.
-    ///
+    /// automatically look up the last selected file for this query and boost it
     pub fn fuzzy_search<'q>(
         &self,
         query: &'q FFFQuery<'q>,
@@ -1283,8 +1173,8 @@ impl FilePicker {
         )
     }
 
-    /// Like [`grep`](Self::grep) but ignores the bigram overlay.
-    pub fn grep_without_overlay(
+    #[doc(hidden)]
+    pub fn grep_original(
         &self,
         query: &FFFQuery<'_>,
         options: &GrepSearchOptions,
@@ -1320,6 +1210,50 @@ impl FilePicker {
             is_watcher_ready: self.signals.watcher_ready.load(Ordering::Relaxed),
             is_warmup_complete: self.sync_data.bigram_index.is_some(),
         }
+    }
+
+    pub(crate) fn set_bigram_index(&mut self, index: BigramFilter, overlay: BigramOverlay) {
+        self.sync_data.bigram_index = Some(Arc::new(index));
+        self.sync_data.bigram_overlay = Some(Arc::new(parking_lot::RwLock::new(overlay)));
+    }
+
+    pub(crate) fn cache_budget_arc(&self) -> Arc<ContentCacheBudget> {
+        Arc::clone(&self.cache_budget)
+    }
+
+    /// Bundle the atomic flags the scan orchestrator needs. One method
+    /// instead of four separate getters so every callsite passes a
+    /// single `ScanSignals` value.
+    pub(crate) fn scan_signals(&self) -> crate::scan::ScanSignals {
+        crate::scan::ScanSignals {
+            scanning: Arc::clone(&self.signals.scanning),
+            watcher_ready: Arc::clone(&self.signals.watcher_ready),
+            cancelled: Arc::clone(&self.signals.cancelled),
+            post_scan_busy: Arc::clone(&self.signals.post_scan_busy),
+            rescan_pending: Arc::clone(&self.signals.rescan_pending),
+        }
+    }
+
+    pub(crate) fn scanned_files_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.scanned_files_count)
+    }
+
+    pub(crate) fn sync_data_snapshot(&self) -> (&[FileItem], usize, ArenaPtr) {
+        (
+            self.sync_data.files(),
+            self.sync_data.indexable_count,
+            self.sync_data.arena_base_ptr(),
+        )
+    }
+
+    pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
+        self.sync_data = sync;
+        self.cache_budget.reset();
+    }
+
+    #[inline]
+    pub(crate) fn arena_base_ptr(&self) -> ArenaPtr {
+        self.sync_data.arena_base_ptr()
     }
 
     /// Update git statuses for files, using the provided shared frecency tracker.
@@ -1407,33 +1341,7 @@ impl FilePicker {
         index.and_then(|i| self.sync_data.get_file_mut(i))
     }
 
-    /// Add a file to the picker's files in sorted order (used by background watcher)
-    pub fn add_file_sorted(&mut self, file: FileItem) -> Option<&FileItem> {
-        let arena = self.arena_base_ptr();
-        let path = file.absolute_path(arena, &self.base_path);
-
-        if self.sync_data.insert_file_sorted(file, &self.base_path) {
-            // File was inserted, look it up
-            self.sync_data
-                .find_file_index(&path, &self.base_path)
-                .ok()
-                .and_then(|idx| self.sync_data.get_file_mut(idx))
-                .map(|file_mut| &*file_mut) // Convert &mut to &
-        } else {
-            // File already exists
-            warn!(
-                "Trying to insert a file that already exists: {}",
-                path.display()
-            );
-            self.sync_data
-                .find_file_index(&path, &self.base_path)
-                .ok()
-                .and_then(|idx| self.sync_data.get_file_mut(idx))
-                .map(|file_mut| &*file_mut) // Convert &mut to &
-        }
-    }
-
-    #[tracing::instrument(skip(self), name = "timing_update", level = Level::DEBUG)]
+    #[tracing::instrument(skip(self),level = Level::DEBUG)]
     pub fn on_create_or_modify(&mut self, path: impl AsRef<Path> + Debug) -> Option<&FileItem> {
         let path = path.as_ref();
 
@@ -1570,129 +1478,11 @@ impl FilePicker {
         self.signals.cancelled.store(true, Ordering::Release);
     }
 
+    /// Stop the background filesystem watcher. Non-blocking.
     pub fn stop_background_monitor(&mut self) {
         if let Some(mut watcher) = self.background_watcher.take() {
             watcher.stop();
         }
-    }
-
-    /// Take the background watcher without joining its owner thread. The
-    /// caller is responsible for dropping the returned value, which joins
-    /// the owner thread via the watcher's `Drop` impl.
-    ///
-    /// Use this from code paths that hold a lock the watcher's threads
-    /// may try to re-acquire (e.g. the global `FILE_PICKER` write lock).
-    /// Calling the blocking `stop()` under such a lock deadlocks: the
-    /// watcher's debounced-event handler or owner thread may itself try
-    /// to `.write()` the picker, and `handle.join()` will wait forever
-    /// for a guard the caller is still holding.
-    ///
-    /// Returns an opaque type-erased value; all the caller needs to know
-    /// is to `drop()` it outside the lock.
-    #[must_use = "dropping the returned handle outside the lock is required to avoid deadlock"]
-    pub fn detach_background_monitor(&mut self) -> Option<Box<dyn Send + 'static>> {
-        self.background_watcher
-            .take()
-            .map(|w| Box::new(w) as Box<dyn Send + 'static>)
-    }
-
-    #[inline]
-    pub(crate) fn arena_base_ptr(&self) -> ArenaPtr {
-        self.sync_data.arena_base_ptr()
-    }
-
-    pub fn trigger_rescan(&mut self, shared_frecency: &SharedFrecency) -> Result<(), Error> {
-        if self.signals.scanning.load(Ordering::Relaxed) {
-            debug!("Scan already in progress, skipping trigger_rescan");
-            return Ok(());
-        }
-
-        // The post-scan warmup + bigram phase holds a raw pointer into the
-        // current files Vec. Replacing sync_data now would free that memory.
-        // Skip — the background watcher will retry on the next event.
-        if self.signals.post_scan_busy.load(Ordering::Acquire) {
-            debug!("Post-scan bigram build in progress, skipping rescan");
-            return Ok(());
-        }
-
-        self.signals.scanning.store(true, Ordering::Relaxed);
-        self.scanned_files_count.store(0, Ordering::Relaxed);
-
-        let walk_result = walk_filesystem(
-            &self.base_path,
-            &self.scanned_files_count,
-            shared_frecency,
-            self.mode,
-        );
-
-        match walk_result {
-            Ok(walk) => {
-                eprintln!(
-                    "TRIGGER_RESCAN: walk produced {} files, base_count={}, indexable_count={}",
-                    walk.sync.files.len(),
-                    walk.sync.base_count,
-                    walk.sync.indexable_count
-                );
-                eprintln!(
-                    "TRIGGER_RESCAN: BEFORE replace: files={}, base_count={}",
-                    self.sync_data.files.len(),
-                    self.sync_data.base_count
-                );
-                info!(
-                    "Filesystem rescan completed: found {} files",
-                    walk.sync.files.len()
-                );
-
-                self.sync_data = walk.sync;
-                self.cache_budget.reset();
-                eprintln!(
-                    "TRIGGER_RESCAN: AFTER replace: files={}, base_count={}",
-                    self.sync_data.files.len(),
-                    self.sync_data.base_count
-                );
-
-                // Apply git status synchronously for rescan (typically fast).
-                if let Ok(Some(git_cache)) = walk.git_handle.join() {
-                    let frecency = shared_frecency.read().ok();
-                    let frecency_ref = frecency.as_ref().and_then(|f| f.as_ref());
-                    let mode = self.mode;
-                    let bp = &self.base_path;
-                    let arena = self.arena_base_ptr();
-
-                    // Reset dir frecency before recomputation.
-                    for dir in self.sync_data.dirs.iter() {
-                        dir.reset_frecency();
-                    }
-
-                    let files = &mut self.sync_data.files;
-                    let dirs = &self.sync_data.dirs;
-                    BACKGROUND_THREAD_POOL.install(|| {
-                        files.par_iter_mut().for_each(|file| {
-                            file.git_status =
-                                git_cache.lookup_status(&file.absolute_path(arena, bp));
-                            if let Some(frecency) = frecency_ref {
-                                let _ = file.update_frecency_scores(frecency, arena, bp, mode);
-                            }
-                            let score = file.access_frecency_score as i32;
-                            if score > 0 {
-                                let dir_idx = file.parent_dir_index() as usize;
-                                if let Some(dir) = dirs.get(dir_idx) {
-                                    dir.update_frecency_if_larger(score);
-                                }
-                            }
-                        });
-                    });
-                }
-
-                // Warmup is deferred to the post-rescan bigram rebuild thread
-                // (spawned by trigger_full_rescan) which does warmup + bigram
-                // in one pass, matching the initial scan's post-scan phase.
-            }
-            Err(error) => error!(?error, "Failed to scan file system"),
-        }
-
-        self.signals.scanning.store(false, Ordering::Relaxed);
-        Ok(())
     }
 
     /// Quick way to check if scan is going without acquiring a lock for [Self::get_scan_progress]
@@ -1700,16 +1490,18 @@ impl FilePicker {
         self.signals.scanning.load(Ordering::Relaxed)
     }
 
-    /// Return a clone of the scanning flag so callers can poll it without
-    /// holding a lock on the picker.
-    pub fn scan_signal(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.signals.scanning)
-    }
-
     /// Return a clone of the watcher-ready flag so callers can poll it without
     /// holding a lock on the picker.
     pub fn watcher_signal(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.signals.watcher_ready)
+    }
+
+    /// Convert an absolute path to a relative path string (relative to base_path).
+    /// Returns None if the path doesn't start with base_path.
+    fn to_relative_path<'a>(&self, path: &'a Path) -> Option<&'a str> {
+        path.strip_prefix(&self.base_path)
+            .ok()
+            .and_then(|p| p.to_str())
     }
 }
 
@@ -1809,162 +1601,238 @@ pub(crate) fn warmup_mmaps(
     });
 }
 
-/// Result of the fast walk phase — files are searchable immediately,
-/// git status arrives later via the join handle.
-pub(crate) struct WalkResult {
-    pub(crate) sync: FileSync,
-    pub(crate) git_handle: std::thread::JoinHandle<Option<GitStatusCache>>,
+impl FileSync {
+    pub(crate) fn discover_git_workdir(base_path: &Path) -> Option<PathBuf> {
+        let git_workdir = Repository::discover(base_path)
+            .ok()
+            .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+            .map(crate::path_utils::normalize);
+
+        match &git_workdir {
+            Some(workdir) => debug!("Git repository found at: {}", workdir.display()),
+            None => warn!("No git repository found for path: {}", base_path.display()),
+        }
+
+        git_workdir
+    }
+
+    pub(crate) fn spawn_git_status(git_workdir: PathBuf) -> JoinHandle<Option<GitStatusCache>> {
+        std::thread::spawn(move || {
+            GitStatusCache::read_git_status(
+                Some(git_workdir.as_path()),
+                &mut crate::git::default_status_options(),
+            )
+        })
+    }
+
+    /// Returns files immediately (searchable) and a handle to the in-progress
+    /// git status computation. This avoids blocking on `git status` which can
+    /// take 10+ seconds on very large repos (e.g. chromium).
+    pub(crate) fn walk_filesystem(
+        base_path: &Path,
+        git_workdir: Option<PathBuf>,
+        synced_files_count: &Arc<AtomicUsize>,
+        shared_frecency: &SharedFrecency,
+        mode: FFFMode,
+    ) -> Result<FileSync, Error> {
+        use ignore::WalkBuilder;
+
+        let scan_start = std::time::Instant::now();
+        info!("SCAN: Starting filesystem walk and git status (async)");
+
+        // Walk files (the fast part, typically 2-3s even on huge repos).
+        let is_git_repo = git_workdir.is_some();
+        let bg_threads = BACKGROUND_THREAD_POOL.current_num_threads();
+
+        let mut walk_builder = WalkBuilder::new(base_path);
+        walk_builder
+            // this is a very important guard for the user opening ~/ or other root non-git dir
+            .hidden(!is_git_repo)
+            .git_ignore(true)
+            .git_exclude(true)
+            .git_global(true)
+            .ignore(true)
+            .follow_links(false)
+            .threads(bg_threads);
+
+        if !is_git_repo && let Some(overrides) = non_git_repo_overrides(base_path) {
+            walk_builder.overrides(overrides);
+        }
+
+        let walker = walk_builder.build_parallel();
+        let walker_start = std::time::Instant::now();
+        debug!("SCAN: Starting file walker");
+
+        // Walk: collect (FileItem, rel_path) pairs. Keep the walk fast —
+        // no chunking, no HashMap, just Vec::push under the Mutex.
+        let pairs = parking_lot::Mutex::new(Vec::<(FileItem, String)>::new());
+
+        walker.run(|| {
+            let pairs = &pairs;
+            let counter = Arc::clone(synced_files_count);
+            let base_path = base_path.to_path_buf();
+
+            Box::new(move |result| {
+                let Ok(entry) = result else {
+                    return ignore::WalkState::Continue;
+                };
+
+                if entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    let path = entry.path();
+
+                    // Ignore walkers sometimes surface files inside `.git/`
+                    // when the base is itself a git repo — skip them.
+                    if is_git_file(path) {
+                        return ignore::WalkState::Continue;
+                    }
+
+                    if !is_git_repo && is_known_binary_extension(path) {
+                        return ignore::WalkState::Continue;
+                    }
+
+                    let metadata = entry.metadata().ok();
+                    let (file_item, rel_path) =
+                        FileItem::new_from_walk(path, &base_path, None, metadata.as_ref());
+
+                    pairs.lock().push((file_item, rel_path));
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                ignore::WalkState::Continue
+            })
+        });
+
+        let mut pairs = pairs.into_inner();
+        info!(
+            "SCAN: File walking completed in {:?} for {} files",
+            walker_start.elapsed(),
+            pairs.len(),
+        );
+
+        // Sort by (dir_part, filename). This groups files by their directory
+        // into contiguous runs so the linear dir-extraction pass below can
+        // dedupe by comparing only against the previous dir.
+        BACKGROUND_THREAD_POOL.install(|| {
+            pairs.par_sort_unstable_by(|(a, path_a), (b, path_b)| {
+                // SAFETY: `filename_offset` is always at a character boundary
+                let (a_dir, a_file) = path_a.split_at(a.path.filename_offset as usize);
+                let (b_dir, b_file) = path_b.split_at(b.path.filename_offset as usize);
+                a_dir.cmp(b_dir).then_with(|| a_file.cmp(b_file))
+            });
+        });
+
+        let mut builder = crate::simd_path::ChunkedPathStoreBuilder::new(pairs.len());
+        let dirs = populates_dirs_files_chunked_storage(&mut pairs, &mut builder);
+
+        let mut files: Vec<FileItem> = pairs.into_iter().map(|(file, _)| file).collect();
+        let chunked_paths = builder.finish();
+        let arena = chunked_paths.as_arena_ptr();
+
+        // Apply frecency scores (access-based only — git status not yet available).
+        // DirItem.max_access_frecency is AtomicI32, so parallel threads write directly.
+        let frecency = shared_frecency
+            .read()
+            .map_err(|_| Error::AcquireFrecencyLock)?;
+
+        if let Some(frecency) = frecency.as_ref() {
+            let dirs_ref = &dirs;
+            BACKGROUND_THREAD_POOL.install(|| {
+                files.par_iter_mut().for_each(|file| {
+                    let _ = file.update_frecency_scores(frecency, arena, base_path, mode);
+                    let score = file.access_frecency_score as i32;
+                    if score > 0 {
+                        let dir_idx = file.parent_dir_index() as usize;
+                        if let Some(dir) = dirs_ref.get(dir_idx) {
+                            dir.update_frecency_if_larger(score);
+                        }
+                    }
+                });
+            });
+        }
+        drop(frecency);
+
+        // Re-sort by (indexable-first, parent_dir, filename). Indexable base
+        // files come first so the bigram builder can size its column bitsets to
+        // just the indexable subset. Within each partition files stay sorted by
+        // (parent_dir, filename) — `find_file_index` does two binary searches
+        // (one per partition) to preserve O(log n) lookups.
+        //
+        // "Indexable" = can possibly contribute bigrams: not binary-by-extension,
+        // non-zero size, not larger than the bigram/mmap cap. The cap matches
+        // `ContentCacheBudget::max_file_size` default (10 MB) — any file above
+        // that is skipped by `build_bigram_index` anyway.
+        const BIGRAM_ELIGIBLE_MAX_SIZE: u64 = 10 * 1024 * 1024;
+        let is_indexable =
+            |f: &FileItem| !f.is_binary() && f.size > 0 && f.size <= BIGRAM_ELIGIBLE_MAX_SIZE;
+        BACKGROUND_THREAD_POOL.install(|| {
+            files.par_sort_unstable_by(|a, b| {
+                // Sort indexables first (true < false when we invert with !).
+                (!is_indexable(a))
+                    .cmp(&!is_indexable(b))
+                    .then_with(|| a.parent_dir_index().cmp(&b.parent_dir_index()))
+                    .then_with(|| a.file_name(arena).cmp(&b.file_name(arena)))
+            });
+        });
+        let indexable_count = files.partition_point(is_indexable);
+
+        // Ask the allocator to return freed pages to the OS.
+        hint_allocator_collect();
+
+        let file_item_size = std::mem::size_of::<FileItem>();
+        let files_vec_bytes = files.len() * file_item_size;
+        let dir_table_bytes = dirs.len() * std::mem::size_of::<DirItem>()
+            + dirs
+                .iter()
+                .map(|d| d.relative_path(arena).len())
+                .sum::<usize>();
+
+        let total_time = scan_start.elapsed();
+        info!(
+            "SCAN: Walk completed in {:?} ({} files, {} dirs, \
+         chunked_store={:.2}MB, files_vec={:.2}MB, dirs={:.2}MB, FileItem={}B)",
+            total_time,
+            files.len(),
+            dirs.len(),
+            chunked_paths.heap_bytes() as f64 / 1_048_576.0,
+            files_vec_bytes as f64 / 1_048_576.0,
+            dir_table_bytes as f64 / 1_048_576.0,
+            file_item_size,
+        );
+
+        let base_count = files.len();
+
+        Ok(FileSync {
+            files,
+            indexable_count,
+            base_count,
+            dirs,
+            overflow_builder: None,
+            git_workdir,
+            bigram_index: None,
+            bigram_overlay: None,
+            chunked_paths: Some(chunked_paths),
+        })
+    }
 }
 
-/// Returns files immediately (searchable) and a handle to the in-progress
-/// git status computation. This avoids blocking on `git status` which can
-/// take 10+ seconds on very large repos (e.g. chromium).
-pub(crate) fn walk_filesystem(
-    base_path: &Path,
-    synced_files_count: &Arc<AtomicUsize>,
-    shared_frecency: &SharedFrecency,
-    mode: FFFMode,
-) -> Result<WalkResult, Error> {
-    use ignore::WalkBuilder;
-
-    let scan_start = std::time::Instant::now();
-    info!("SCAN: Starting filesystem walk and git status (async)");
-
-    // Discover git root (fast — just walks up looking for .git/)
-    let git_workdir = Repository::discover(base_path)
-        .ok()
-        .and_then(|repo| repo.workdir().map(Path::to_path_buf));
-
-    if let Some(ref git_dir) = git_workdir {
-        debug!("Git repository found at: {}", git_dir.display());
-    } else {
-        debug!("No git repository found for path: {}", base_path.display());
-    }
-
-    // Spawn git status on a detached thread — we won't wait for it here.
-    let git_workdir_for_status = git_workdir.clone();
-    let git_handle = std::thread::spawn(move || {
-        GitStatusCache::read_git_status(
-            git_workdir_for_status.as_deref(),
-            &mut crate::git::default_status_options(),
-        )
-    });
-
-    // Walk files (the fast part, typically 2-3s even on huge repos).
-    let is_git_repo = git_workdir.is_some();
-    let bg_threads = BACKGROUND_THREAD_POOL.current_num_threads();
-
-    let mut walk_builder = WalkBuilder::new(base_path);
-    walk_builder
-        // this is a very important guard for the user opening ~/ or other root non-git dir
-        .hidden(!is_git_repo)
-        .git_ignore(true)
-        .git_exclude(true)
-        .git_global(true)
-        .ignore(true)
-        .follow_links(false)
-        .threads(bg_threads);
-
-    if !is_git_repo && let Some(overrides) = non_git_repo_overrides(base_path) {
-        walk_builder.overrides(overrides);
-    }
-
-    let walker = walk_builder.build_parallel();
-    let walker_start = std::time::Instant::now();
-    debug!("SCAN: Starting file walker");
-
-    // Walk: collect (FileItem, rel_path) pairs. Keep the walk fast —
-    // no chunking, no HashMap, just Vec::push under the Mutex.
-    let pairs = parking_lot::Mutex::new(Vec::<(FileItem, String)>::new());
-
-    walker.run(|| {
-        let pairs = &pairs;
-        let counter = Arc::clone(synced_files_count);
-        let base_path = base_path.to_path_buf();
-
-        Box::new(move |result| {
-            let Ok(entry) = result else {
-                return ignore::WalkState::Continue;
-            };
-
-            if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                let path = entry.path();
-
-                // Ignore walkers sometimes surface files inside `.git/`
-                // when the base is itself a git repo — skip them.
-                if is_git_file(path) {
-                    return ignore::WalkState::Continue;
-                }
-
-                if !is_git_repo && is_known_binary_extension(path) {
-                    return ignore::WalkState::Continue;
-                }
-
-                let metadata = entry.metadata().ok();
-                let (file_item, rel_path) =
-                    FileItem::new_from_walk(path, &base_path, None, metadata.as_ref());
-
-                pairs.lock().push((file_item, rel_path));
-                counter.fetch_add(1, Ordering::Relaxed);
-            }
-            ignore::WalkState::Continue
-        })
-    });
-
-    let mut pairs = pairs.into_inner();
-
-    info!(
-        "SCAN: File walking completed in {:?} for {} files",
-        walker_start.elapsed(),
-        pairs.len(),
-    );
-
-    // Sort by (dir_part, filename). This groups files by their directory
-    // into contiguous runs so the linear dir-extraction pass below can
-    // dedupe by comparing only against the previous dir.
-    //
-    // An earlier version sorted by full relative path. That ordering works
-    // for uniform depths but breaks for mixed trees: root-level files with
-    // names that sort between two subdirectories end up interleaved,
-    // causing the consecutive-dedup to emit the root dir multiple times
-    // (e.g. seed order `README.md`, `d_foo/a.rs`, `f_root.rs`, `src/x.rs`
-    // produced `dirs = ["", "d_foo/", "", "src/"]`). The duplicate broke
-    // `find_file_index`'s binary search — files with `parent_dir=0` became
-    // unreachable when the search resolved `dir_rel=""` to the duplicate
-    // at index 2.
-    BACKGROUND_THREAD_POOL.install(|| {
-        pairs.par_sort_unstable_by(|(a, path_a), (b, path_b)| {
-            let a_off = a.path.filename_offset as usize;
-            let b_off = b.path.filename_offset as usize;
-            // SAFETY note: `filename_offset` is a byte offset into the
-            // UTF-8 relative path that the walker recorded. It always
-            // lies on a character boundary.
-            let (a_dir, a_name) = path_a.split_at(a_off);
-            let (b_dir, b_name) = path_b.split_at(b_off);
-            a_dir.cmp(b_dir).then_with(|| a_name.cmp(b_name))
-        });
-    });
-
-    // Build ChunkedPathStore + extract dirs + assign parent_dir in one pass.
-    // Files are sorted by relative path, so dir changes happen in order.
-    // add_file_immediate returns a ChunkedString with null arena_base;
-    // we fixup arena_base after the arena is frozen.
-    let mut files: Vec<FileItem> = Vec::with_capacity(pairs.len());
+/// This does both thing (yes sorry all the OOP morons)
+/// in one go: populates files chunked storage and creates new directories
+fn populates_dirs_files_chunked_storage<'a>(
+    pairs: &'a mut [(FileItem, String)],
+    builder: &mut crate::simd_path::ChunkedPathStoreBuilder,
+) -> Vec<DirItem> {
     let mut dirs: Vec<DirItem> = Vec::new();
-    let mut builder = crate::simd_path::ChunkedPathStoreBuilder::new(pairs.len());
-    // Reusable buffer for the previously emitted dir path. `prev_dir_valid`
-    // tracks whether `prev_dir` has been populated (so the first iteration
-    // always enters the dir branch, even if `dir_part == ""`).
-    let mut prev_dir: String = String::new();
-    let mut prev_dir_valid: bool = false;
+
+    let mut prev_dir: &'a str = "";
+    let mut prev_dir_valid = false;
     let mut current_dir_idx: u32 = 0;
 
-    for (mut file, rel) in pairs {
-        let fname_offset = file.path.filename_offset as usize;
-        let dir_part = &rel[..fname_offset];
+    for (file, rel) in pairs.iter_mut() {
+        let rel: &'a str = rel;
+        let dir_part: &'a str = &rel[..file.path.filename_offset as usize];
 
-        if !prev_dir_valid || prev_dir.as_str() != dir_part {
-            let dir_cs = builder.add_dir_immediate(dir_part);
+        if !prev_dir_valid || prev_dir != dir_part {
+            let dir_string = builder.add_dir_immediate(dir_part);
+
             // Compute last-segment offset: for "src/components/" -> 4 (points to "components/")
             let last_seg = if dir_part.is_empty() {
                 0
@@ -1975,107 +1843,21 @@ pub(crate) fn walk_filesystem(
                     .map(|i| i + 1)
                     .unwrap_or(0) as u16
             };
-            dirs.push(DirItem::new(dir_cs, last_seg));
+
+            dirs.push(DirItem::new(dir_string, last_seg));
             current_dir_idx = (dirs.len() - 1) as u32;
-            prev_dir.clear();
-            prev_dir.push_str(dir_part);
+
+            prev_dir = dir_part;
             prev_dir_valid = true;
         }
 
-        let cs = builder.add_file_immediate(&rel, file.path.filename_offset);
+        let cs = builder.add_file_immediate(rel, file.path.filename_offset);
+
         file.set_path(cs);
         file.set_parent_dir(current_dir_idx);
-        files.push(file);
     }
-    let chunked_paths = builder.finish();
-    let arena = chunked_paths.as_arena_ptr();
 
-    // Apply frecency scores (access-based only — git status not yet available).
-    // DirItem.max_access_frecency is AtomicI32, so parallel threads write directly.
-    let frecency = shared_frecency
-        .read()
-        .map_err(|_| Error::AcquireFrecencyLock)?;
-    if let Some(frecency) = frecency.as_ref() {
-        let dirs_ref = &dirs;
-        BACKGROUND_THREAD_POOL.install(|| {
-            files.par_iter_mut().for_each(|file| {
-                let _ = file.update_frecency_scores(frecency, arena, base_path, mode);
-                let score = file.access_frecency_score as i32;
-                if score > 0 {
-                    let dir_idx = file.parent_dir_index() as usize;
-                    if let Some(dir) = dirs_ref.get(dir_idx) {
-                        dir.update_frecency_if_larger(score);
-                    }
-                }
-            });
-        });
-    }
-    drop(frecency);
-
-    // Re-sort by (indexable-first, parent_dir, filename). Indexable base
-    // files come first so the bigram builder can size its column bitsets to
-    // just the indexable subset. Within each partition files stay sorted by
-    // (parent_dir, filename) — `find_file_index` does two binary searches
-    // (one per partition) to preserve O(log n) lookups.
-    //
-    // "Indexable" = can possibly contribute bigrams: not binary-by-extension,
-    // non-zero size, not larger than the bigram/mmap cap. The cap matches
-    // `ContentCacheBudget::max_file_size` default (10 MB) — any file above
-    // that is skipped by `build_bigram_index` anyway.
-    const BIGRAM_ELIGIBLE_MAX_SIZE: u64 = 10 * 1024 * 1024;
-    let is_indexable =
-        |f: &FileItem| !f.is_binary() && f.size > 0 && f.size <= BIGRAM_ELIGIBLE_MAX_SIZE;
-    BACKGROUND_THREAD_POOL.install(|| {
-        files.par_sort_unstable_by(|a, b| {
-            // Sort indexables first (true < false when we invert with !).
-            (!is_indexable(a))
-                .cmp(&!is_indexable(b))
-                .then_with(|| a.parent_dir_index().cmp(&b.parent_dir_index()))
-                .then_with(|| a.file_name(arena).cmp(&b.file_name(arena)))
-        });
-    });
-    let indexable_count = files.partition_point(is_indexable);
-
-    // Ask the allocator to return freed pages to the OS.
-    hint_allocator_collect();
-
-    let file_item_size = std::mem::size_of::<FileItem>();
-    let files_vec_bytes = files.len() * file_item_size;
-    let dir_table_bytes = dirs.len() * std::mem::size_of::<DirItem>()
-        + dirs
-            .iter()
-            .map(|d| d.relative_path(arena).len())
-            .sum::<usize>();
-
-    let total_time = scan_start.elapsed();
-    info!(
-        "SCAN: Walk completed in {:?} ({} files, {} dirs, \
-         chunked_store={:.2}MB, files_vec={:.2}MB, dirs={:.2}MB, FileItem={}B)",
-        total_time,
-        files.len(),
-        dirs.len(),
-        chunked_paths.heap_bytes() as f64 / 1_048_576.0,
-        files_vec_bytes as f64 / 1_048_576.0,
-        dir_table_bytes as f64 / 1_048_576.0,
-        file_item_size,
-    );
-
-    let base_count = files.len();
-
-    Ok(WalkResult {
-        sync: FileSync {
-            files,
-            indexable_count,
-            base_count,
-            dirs,
-            overflow_builder: None,
-            git_workdir,
-            bigram_index: None,
-            bigram_overlay: None,
-            chunked_paths: Some(chunked_paths),
-        },
-        git_handle,
-    })
+    dirs
 }
 
 pub(crate) fn apply_git_status_and_frecency(
@@ -2293,58 +2075,6 @@ pub(crate) fn hint_allocator_collect() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::SharedFrecency;
-
-    /// The overflow arena (ChunkedPathStoreBuilder) grows every time a new
-    /// file is created after the initial scan and is never reclaimed on
-    /// removal. `trigger_rescan` replaces `sync_data`, dropping the builder
-    /// and resetting the overflow count to 0 — the only path that reclaims
-    /// the arena memory.
-    #[test]
-    fn trigger_rescan_reclaims_overflow() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Initial scan with one existing file. The base index locks in at
-        // size 1; everything added after this lives in overflow.
-        std::fs::write(dir.path().join("seed.txt"), b"seed").unwrap();
-
-        let mut picker = FilePicker::new(FilePickerOptions {
-            base_path: dir.path().to_str().unwrap().into(),
-            watch: false,
-            ..Default::default()
-        })
-        .unwrap();
-        picker.collect_files().unwrap();
-        assert_eq!(picker.get_files().len(), 1);
-        assert_eq!(picker.get_overflow_files().len(), 0);
-
-        // Create several new files and push them through the same code path
-        // the background watcher uses. Each call appends to the overflow
-        // builder's arena and chunk_dedup HashMap.
-        for i in 0..5 {
-            let path = dir.path().join(format!("new_{i}.txt"));
-            std::fs::write(&path, b"content").unwrap();
-            assert!(picker.on_create_or_modify(&path).is_some());
-        }
-        assert_eq!(picker.get_overflow_files().len(), 5);
-
-        // Remove two of them: `remove_file_by_path` drops the FileItem via
-        // `Vec::remove` but does NOT shrink the builder arena.
-        for i in 0..2 {
-            let path = dir.path().join(format!("new_{i}.txt"));
-            std::fs::remove_file(&path).unwrap();
-            assert!(picker.remove_file_by_path(&path));
-        }
-        assert_eq!(picker.get_overflow_files().len(), 3);
-
-        // Full rescan: replaces sync_data, drops the builder, and re-indexes
-        // from disk. All surviving files become base files again.
-        let frecency = SharedFrecency::default();
-        picker.trigger_rescan(&frecency).unwrap();
-        assert_eq!(picker.get_overflow_files().len(), 0);
-        // 1 seed + 3 surviving new_*.txt = 4 base files after rescan.
-        assert_eq!(picker.get_files().len(), 4);
-    }
 
     /// The watcher must watch every ancestor directory up to `base_path`,
     /// not just the immediate parents of indexed files. Intermediate dirs

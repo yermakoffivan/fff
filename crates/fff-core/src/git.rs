@@ -45,10 +45,14 @@ impl GitStatusCache {
             return Ok(Self(AHashMap::new())); // repo is bare
         };
 
+        let repo_path = crate::path_utils::normalize(repo_path.to_path_buf());
+
         let mut entries = AHashMap::with_capacity(statuses.len());
         for entry in &statuses {
             if let Some(entry_path) = entry.path() {
-                let full_path = repo_path.join(entry_path);
+                // libgit2 returns entry paths with forward slashes on every platform
+                // fff stores native paths - meaning we have forward slash issue on windows
+                let full_path = crate::path_utils::normalize(repo_path.join(entry_path));
                 entries.insert(full_path, entry.status());
             }
         }
@@ -87,12 +91,13 @@ impl GitStatusCache {
         let Some(workdir) = repo.workdir() else {
             return Ok(Self(AHashMap::new()));
         };
+        let workdir = crate::path_utils::normalize(workdir.to_path_buf());
 
         // git pathspec is pretty slow and requires to walk the whole directory
         // so for a single file which is the most general use case we query directly the file
         if paths.len() == 1 {
             let full_path = paths[0].as_ref();
-            let relative_path = full_path.strip_prefix(workdir)?;
+            let relative_path = full_path.strip_prefix(&workdir)?;
             let status = repo.status_file(relative_path)?;
 
             let mut map = AHashMap::with_capacity(1);
@@ -102,7 +107,7 @@ impl GitStatusCache {
 
         let mut status_options = default_status_options();
         for path in paths {
-            status_options.pathspec(path.as_ref().strip_prefix(workdir)?);
+            status_options.pathspec(path.as_ref().strip_prefix(&workdir)?);
         }
 
         let git_status_cache = Self::read_status_impl(repo, &mut status_options)?;

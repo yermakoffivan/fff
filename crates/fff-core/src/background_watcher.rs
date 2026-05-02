@@ -82,7 +82,7 @@ impl BackgroundWatcher {
         let (watch_tx, watch_rx) = mpsc::channel::<PathBuf>();
         let watch_tx_for_debouncer = watch_tx.clone();
 
-        let owner_weak_picker = shared_picker.downgrade();
+        let owner_weak_picker = shared_picker.weaken();
         let owner_frecency = shared_frecency.clone();
         let owner_git_workdir = git_workdir.clone();
 
@@ -100,6 +100,9 @@ impl BackgroundWatcher {
 
         // debouncer is shared with the owner thread, once it's dropped the thread is closed
         let debouncer = Arc::new(Mutex::new(Some(debouncer)));
+        // Only the Linux per-dir-watch branch needs this clone; on other
+        // platforms the owner thread never touches the debouncer.
+        #[cfg(target_os = "linux")]
         let owner_debouncer = Arc::clone(&debouncer);
 
         let owner_thread = std::thread::Builder::new()
@@ -111,15 +114,39 @@ impl BackgroundWatcher {
                         break;
                     };
 
-                    if let Some(debouncer) = owner_debouncer.lock().as_mut() {
-                        process_watch_request(
-                            debouncer,
-                            &dir,
-                            &strong_picker,
-                            &owner_frecency,
-                            &owner_git_workdir,
-                        );
+                    // Only inotify (Linux) has no kernel-level recursion, so
+                    // it's the only platform that needs a per-subdir watch to
+                    // be registered at runtime. macOS FSEvents and Windows
+                    // ReadDirectoryChangesW are already watching recursively
+                    // from the base path (see `create_debouncer`), and
+                    // registering a second overlapping stream there produces
+                    // duplicate/out-of-order events.
+                    #[cfg(target_os = "linux")]
+                    {
+                        // Register the new directory with the debouncer, then
+                        // drop the mutex BEFORE doing picker-side work — see
+                        // the comment on `BackgroundWatcher::stop` for the
+                        // lock-ordering rationale.
+                        let mut guard = owner_debouncer.lock();
+                        let Some(debouncer) = guard.as_mut() else {
+                            break;
+                        };
+
+                        if let Err(e) = debouncer.watch(&dir, RecursiveMode::NonRecursive) {
+                            warn!(
+                                ?e,
+                                dir = %dir.display(),
+                                "Failed to init watcher for new directory"
+                            );
+                        }
                     }
+
+                    track_files_from_new_directories(
+                        &dir,
+                        &strong_picker,
+                        &owner_frecency,
+                        &owner_git_workdir,
+                    );
 
                     // Transient strong ref drops here, back
                     // to weak-only before the next `recv()`.
@@ -165,7 +192,7 @@ impl BackgroundWatcher {
         // Capture a weak handle instead and upgrade per-batch.
         let git_workdir_for_handler = git_workdir.clone();
         let shared_picker_for_watching = shared_picker.clone();
-        let event_picker = shared_picker.downgrade();
+        let event_picker = shared_picker.weaken();
         let mut debouncer = new_debouncer_opt(
             DEBOUNCE_TIMEOUT,
             Some(DEBOUNCE_TIMEOUT / 2), // tick rate for the event span
@@ -313,10 +340,30 @@ impl BackgroundWatcher {
         Ok(debouncer)
     }
 
+    /// Signal the watcher to shut down without blocking on its worker
+    /// threads. Safe to call from any context, including while holding
+    /// the [`SharedFilePicker`] write lock.
+    ///
+    /// Both the debouncer's internal event loop and our owner thread
+    /// may call `SharedFilePicker::write()` inside their handlers. A
+    /// blocking join here would deadlock against a caller that already
+    /// holds that lock (e.g. `stop_background_monitor` under a
+    /// `shared_picker.write()` guard). Instead we:
+    ///
+    ///   * drop the `watch_tx` Sender — the owner thread's
+    ///     `watch_rx.recv()` returns `Err` and the thread exits at
+    ///     its next `recv`.
+    ///   * call `debouncer.stop_nonblocking()` — signals the debouncer
+    ///     event loop to exit on its next tick and drops the watcher,
+    ///     closing the FSEvent / inotify / ReadDirectoryChangesW stream.
+    ///   * detach both `JoinHandle`s.
+    ///
+    /// In-flight handler invocations finish on their own (at most one
+    /// more batch) once the caller releases any locks they hold.
     pub fn stop(&mut self) {
         self.watch_tx.take();
         if let Some(debouncer) = self.debouncer.lock().take() {
-            debouncer.stop();
+            debouncer.stop_nonblocking();
         }
 
         self.owner_thread.take();
@@ -344,29 +391,6 @@ impl Drop for BackgroundWatcher {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-/// Handle a single `watch_rx` entry: register a non-recursive watch on
-/// the directory and inject any files that already exist inside it.
-///
-/// Extracted so both the `recv_timeout` wakeup branch and the inner
-/// `try_recv` drain loop in the owner thread share one implementation.
-fn process_watch_request(
-    debouncer: &mut Debouncer,
-    dir: &Path,
-    shared_picker: &SharedFilePicker,
-    shared_frecency: &SharedFrecency,
-    git_workdir: &Option<PathBuf>,
-) {
-    // macos uses a single watcher per file directory which is
-    if !cfg!(target_os = "macos") {
-        match debouncer.watch(dir, RecursiveMode::NonRecursive) {
-            Ok(()) => debug!("Added watch for new directory: {}", dir.display()),
-            Err(e) => warn!("Failed to watch new directory {}: {}", dir.display(), e),
-        }
-    }
-
-    track_files_from_new_directories(dir, shared_picker, shared_frecency, git_workdir);
 }
 
 #[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency), level = Level::DEBUG)]

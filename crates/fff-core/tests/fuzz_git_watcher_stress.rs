@@ -334,7 +334,14 @@ fn run_stress_scenario(ops: &[AbstractOp]) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
+                // Default to DEBUG for fff crates so CI failures on
+                // flaky OSes (Windows) include the watcher/event trail
+                // without needing to re-run with RUST_LOG set.
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(
+                        "warn,fff_search=debug,notify=debug,notify_debouncer_full=debug",
+                    )
+                }),
         )
         .with_test_writer()
         .try_init();
@@ -578,10 +585,108 @@ fn converge_git_status(
                 report.push_str(&probe_msg);
                 report.push('\n');
             }
+            report.push_str(&debug_dump_environment(
+                base,
+                shared_picker,
+                &last_mismatches,
+            ));
             return Err(report);
         }
         std::thread::sleep(CONVERGE_POLL);
     }
+}
+
+/// On-failure diagnostic dump. Includes:
+///   * base path (raw + OS encoding) so we can spot UNC/`\\?\` prefixes on Windows
+///   * picker's own `base_path()` for comparison
+///   * direct libgit2 `status_file` probes for every mismatched path
+///   * full picker enumeration (first 20 rows) so we can see what keys
+///     the picker is returning vs. what git2 reports
+fn debug_dump_environment(
+    base: &Path,
+    shared_picker: &SharedFilePicker,
+    mismatches: &[Mismatch],
+) -> String {
+    let mut s = String::new();
+    s.push_str("\n── diagnostic dump ──\n");
+    s.push_str(&format!(
+        "test base path (display)   : {}\n",
+        base.display()
+    ));
+    s.push_str(&format!("test base path (debug)     : {:?}\n", base));
+    s.push_str(&format!(
+        "test base path (os bytes)  : {:?}\n",
+        base.as_os_str()
+    ));
+
+    if let Ok(guard) = shared_picker.read()
+        && let Some(picker) = guard.as_ref()
+    {
+        s.push_str(&format!(
+            "picker base_path (display) : {}\n",
+            picker.base_path().display()
+        ));
+        s.push_str(&format!(
+            "picker base_path (debug)   : {:?}\n",
+            picker.base_path()
+        ));
+    }
+
+    // Probe libgit2 directly for each mismatched path.
+    if let Ok(repo) = Repository::open(base) {
+        s.push_str("\nlibgit2 status_file probes (per mismatch path):\n");
+        for m in mismatches {
+            let path = match m {
+                Mismatch::Disagree { path, .. } => path,
+                Mismatch::ExtraInPicker { path, .. } => path,
+            };
+            match repo.status_file(std::path::Path::new(path)) {
+                Ok(st) => s.push_str(&format!("  • {path} -> {st:?}\n")),
+                Err(e) => {
+                    s.push_str(&format!(
+                        "  • {path} -> ERROR {} (class={:?}, code={:?})\n",
+                        e.message(),
+                        e.class(),
+                        e.code()
+                    ));
+                }
+            }
+        }
+    } else {
+        s.push_str("\nlibgit2: could not open repo at base path\n");
+    }
+
+    // Dump the raw picker enumeration for comparison — up to 20 rows.
+    s.push_str("\npicker enumeration (first 20 entries, with byte-repr of each relative path):\n");
+    if let Ok(guard) = shared_picker.read()
+        && let Some(picker) = guard.as_ref()
+    {
+        let parser = QueryParser::default();
+        let parsed = parser.parse("");
+        let result = picker.fuzzy_search(
+            &parsed,
+            None,
+            FuzzySearchOptions {
+                max_threads: 1,
+                pagination: PaginationArgs {
+                    offset: 0,
+                    limit: 100,
+                },
+                ..Default::default()
+            },
+        );
+        for (i, f) in result.items.iter().take(20).enumerate() {
+            let raw = f.relative_path(picker);
+            let norm = normalize(raw.clone());
+            s.push_str(&format!(
+                "  [{i:>2}] raw={raw:?} norm={norm:?} status={:?}\n",
+                f.git_status
+            ));
+        }
+        s.push_str(&format!("  (total: {} items)\n", result.items.len()));
+    }
+
+    s
 }
 
 #[derive(Debug)]
@@ -1172,7 +1277,14 @@ fn stress_merge_conflict_convergence() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
+                // Default to DEBUG for fff crates so CI failures on
+                // flaky OSes (Windows) include the watcher/event trail
+                // without needing to re-run with RUST_LOG set.
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(
+                        "warn,fff_search=debug,notify=debug,notify_debouncer_full=debug",
+                    )
+                }),
         )
         .with_test_writer()
         .try_init();

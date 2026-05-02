@@ -92,31 +92,23 @@ pub fn init_file_picker(_: &Lua, base_path: String) -> LuaResult<bool> {
 }
 
 fn reinit_file_picker_internal(path: &Path) -> Result<(), Error> {
-    // Cancel the old picker and detach its watcher under the write lock,
-    // but JOIN the watcher's owner thread outside the lock. The watcher's
-    // owner thread and its debouncer callback may themselves re-acquire
-    // FILE_PICKER.write/read (e.g. `inject_existing_files`, the debounced
-    // event handler), so joining while still holding the write lock here
-    // deadlocks the main thread against the background watcher.
-    let detached_watcher = {
+    // Cancel and stop the old picker's watcher under the write lock.
+    // `stop_background_monitor` is non-blocking (signals the debouncer
+    // to exit on its next tick without joining), so it's safe under
+    // the lock. In-flight watcher handlers finish naturally once we
+    // release the guard.
+    {
         let mut guard = FILE_PICKER.write()?;
         if let Some(ref mut picker) = *guard {
-            // Signal cancellation BEFORE detaching the watcher so any
+            // Signal cancellation BEFORE stopping the watcher so any
             // orphaned scan/post-scan threads discard their results
             // instead of racing with the new picker.
             picker.cancel();
-            picker.detach_background_monitor()
-        } else {
-            None
+            picker.stop_background_monitor();
         }
         // Don't take() the picker here — leave the old one in place so
         // searches still work until new_with_shared_state replaces it.
-    };
-
-    // Drop the watcher outside the lock. Its `Drop` joins the owner thread,
-    // whose last act may be a write on FILE_PICKER — safe now that we hold
-    // no guard.
-    drop(detached_watcher);
+    }
 
     // Create new picker — this atomically replaces the old one via write lock
     FilePicker::new_with_shared_state(
@@ -529,18 +521,14 @@ pub fn update_single_file_frecency(_: &Lua, file_path: String) -> LuaResult<bool
 }
 
 pub fn stop_background_monitor(_: &Lua, _: ()) -> LuaResult<bool> {
-    // Detach the watcher under the write lock, then drop it outside.
-    // The watcher's owner thread / debouncer may itself try to take
-    // FILE_PICKER.write when servicing a pending event (e.g.
-    // `inject_existing_files`), so joining it under the lock deadlocks.
-    let detached = {
-        let mut file_picker = FILE_PICKER.write().into_lua_result()?;
-        let Some(ref mut picker) = *file_picker else {
-            return Err(error::to_lua_error(Error::FilePickerMissing));
-        };
-        picker.detach_background_monitor()
+    // `stop_background_monitor` is non-blocking — the debouncer /
+    // owner threads exit on their next iteration, so it is safe to
+    // call under the FILE_PICKER write lock.
+    let mut file_picker = FILE_PICKER.write().into_lua_result()?;
+    let Some(ref mut picker) = *file_picker else {
+        return Err(error::to_lua_error(Error::FilePickerMissing));
     };
-    drop(detached);
+    picker.stop_background_monitor();
     Ok(true)
 }
 
@@ -680,39 +668,9 @@ pub fn parse_grep_query(lua: &Lua, query: String) -> LuaResult<LuaTable> {
 }
 
 pub fn wait_for_initial_scan(_: &Lua, timeout_ms: Option<u64>) -> LuaResult<bool> {
-    // Extract the scan signal Arc WITHOUT holding the read lock, so the
-    // scan thread can acquire the write lock to store its results.
-    // Holding a read lock while polling would deadlock: the scan thread
-    // needs a write lock to finish, but can't acquire it while we hold the read lock.
-    let scan_signal = {
-        let file_picker = FILE_PICKER.read().into_lua_result()?;
-        let picker = file_picker
-            .as_ref()
-            .ok_or(Error::FilePickerMissing)
-            .into_lua_result()?;
-        picker.scan_signal()
-    }; // read lock released here
+    let scanned = FILE_PICKER.wait_for_scan(Duration::from_millis(timeout_ms.unwrap_or(500)));
 
-    let timeout_ms = timeout_ms.unwrap_or(500);
-    let timeout_duration = Duration::from_millis(timeout_ms);
-    let start_time = std::time::Instant::now();
-    let mut sleep_duration = Duration::from_millis(1);
-
-    while scan_signal.load(std::sync::atomic::Ordering::Relaxed) {
-        if start_time.elapsed() >= timeout_duration {
-            ::tracing::warn!("wait_for_initial_scan timed out after {}ms", timeout_ms);
-            return Ok(false);
-        }
-
-        std::thread::sleep(sleep_duration);
-        sleep_duration = std::cmp::min(sleep_duration * 2, Duration::from_millis(50));
-    }
-
-    ::tracing::debug!(
-        "wait_for_initial_scan completed in {:?}",
-        start_time.elapsed()
-    );
-    Ok(true)
+    Ok(scanned)
 }
 
 pub fn init_tracing(

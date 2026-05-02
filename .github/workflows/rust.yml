@@ -19,6 +19,9 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
+    # Guard against deadlocks in the shared-picker / watcher teardown
+    # path: a stuck test would otherwise consume a full 6h CI slot.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       

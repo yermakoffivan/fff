@@ -126,14 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // If async scan didn't work, trigger a manual scan
     if !scan_completed {
         println!("Triggering manual rescan...");
-        if let Ok(mut guard) = shared_picker.write()
-            && let Some(ref mut picker) = *guard
-        {
-            match picker.trigger_rescan(&shared_frecency) {
-                Ok(_) => println!("Manual rescan completed"),
-                Err(e) => println!("Manual rescan failed: {:?}", e),
-            }
-        }
+        let _ = shared_picker.trigger_full_rescan_async(&shared_frecency);
     }
 
     let initial_file_count = {

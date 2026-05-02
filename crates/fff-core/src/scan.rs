@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tracing::{error, info};
 
+use crate::FileSync;
 use crate::background_watcher::BackgroundWatcher;
 use crate::bigram_filter::BigramOverlay;
 use crate::bigram_filter::build_bigram_index;
@@ -40,27 +41,17 @@ use crate::types::ContentCacheBudget;
 /// signal its progress. Grouped so every callsite passes one value,
 /// not four.
 #[derive(Clone, Default)]
-pub struct ScanSignals {
-    /// `true` while any scan phase is running. Readers (progress FFI,
-    /// `wait_for_scan`) poll this.
-    pub scanning: Arc<AtomicBool>,
+pub(crate) struct ScanSignals {
+    /// Set to `true` while any scan phase is running
+    pub(crate) scanning: Arc<AtomicBool>,
     /// Set to `true` once the filesystem watcher has been installed
-    /// (initial scan only). Watcher-dependent callers block on it.
-    pub watcher_ready: Arc<AtomicBool>,
-    /// Short-circuits a scan that's racing a `FilePicker` replacement.
-    /// Owned by `FilePicker` and flipped by `FilePicker::cancel`.
-    pub cancelled: Arc<AtomicBool>,
-    /// `true` while the raw-pointer snapshot used by warmup + bigram
-    /// build is live. Concurrent rescans skip themselves until this
-    /// clears so `sync_data` can't be freed under the snapshot.
-    pub post_scan_busy: Arc<AtomicBool>,
-    /// Set by any caller that asked for a full rescan while one was
-    /// already running (see [`SharedPicker::trigger_full_rescan_async`]).
-    /// The currently running scan swaps this back to `false` at the end
-    /// of [`ScanJob::run`] and — if it was set — spawns exactly one
-    /// follow-up scan. Without this, `.gitignore` edits or overflow
-    /// rescans that landed during an in-flight scan were silently lost.
-    pub rescan_pending: Arc<AtomicBool>,
+    pub(crate) watcher_ready: Arc<AtomicBool>,
+    /// Indicates that that owning picker was requested to shut down
+    pub(crate) cancelled: Arc<AtomicBool>,
+    /// Soft lock indicating that the post scan non blocking work is active
+    pub(crate) post_scan_busy: Arc<AtomicBool>,
+    /// Used to resolve conflicts if multiple rescans were triggered in a queue
+    pub(crate) rescan_pending: Arc<AtomicBool>,
 }
 
 /// Which optional phases a scan should run.
@@ -117,9 +108,9 @@ impl ScanJob {
             signals,
             scanned_files_counter: picker.scanned_files_counter(),
             config: ScanConfig {
-                warmup: picker.need_enable_mmap_cache(),
-                content_indexing: picker.need_enable_content_indexing(),
-                watch: picker.need_watch(),
+                warmup: picker.has_mmap_cache(),
+                content_indexing: picker.has_content_indexing(),
+                watch: picker.has_watcher(),
                 auto_cache_budget: !picker.has_explicit_cache_budget(),
                 install_watcher,
             },
@@ -152,6 +143,7 @@ impl ScanJob {
 
     /// Spawn the job on a dedicated OS thread. Returns immediately.
     pub fn spawn(self) -> std::thread::JoinHandle<()> {
+        self.signals.scanning.store(true, Ordering::Release);
         std::thread::Builder::new()
             .name("fff-scan".into())
             .spawn(move || self.run())
@@ -175,14 +167,17 @@ impl ScanJob {
         // and `get_scan_progress` reads it without locks.
         scanned_files_counter.store(0, Ordering::Relaxed);
 
-        // 1. Walk filesystem off-lock.
-        let walk = match file_picker::walk_filesystem(
+        // 1. Start git discovery and walk filesystem off-lock.
+        let git_workdir = FileSync::discover_git_workdir(&base_path);
+        let status_handle = git_workdir.clone().map(FileSync::spawn_git_status);
+        let sync = match FileSync::walk_filesystem(
             &base_path,
+            git_workdir,
             &scanned_files_counter,
             &shared_frecency,
             mode,
         ) {
-            Ok(w) => w,
+            Ok(sync) => sync,
             Err(e) => {
                 error!(?e, "scan walk failed");
                 return;
@@ -194,13 +189,13 @@ impl ScanJob {
             return;
         }
 
-        let git_workdir = walk.sync.git_workdir.clone();
+        let git_workdir = sync.git_workdir.clone();
 
         // 2. Brief write to install the freshly-walked file list.
         if let Ok(mut guard) = shared_picker.write()
             && let Some(picker) = guard.as_mut()
         {
-            picker.commit_new_sync(walk.sync);
+            picker.commit_new_sync(sync);
         } else {
             error!("failed to install scan results into picker");
             return;
@@ -218,11 +213,13 @@ impl ScanJob {
         }
 
         // 3. Apply git status + frecency off-lock.
-        if !signals.cancelled.load(Ordering::Acquire) {
+        if !signals.cancelled.load(Ordering::Acquire)
+            && let Some(status_handle) = status_handle
+        {
             file_picker::apply_git_status_and_frecency(
                 &shared_picker,
                 &shared_frecency,
-                walk.git_handle,
+                status_handle,
                 mode,
             );
         }
@@ -395,7 +392,7 @@ fn resubscribe_to_new_picker(shared_picker: &SharedFilePicker) {
     let Some(picker) = guard.as_ref() else {
         return;
     };
-    let Some(watcher) = picker.background_watcher_ref() else {
+    let Some(watcher) = picker.background_watcher.as_ref() else {
         return;
     };
 

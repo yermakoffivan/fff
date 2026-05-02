@@ -7,6 +7,7 @@ use crate::file_picker::FilePicker;
 use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
 use crate::query_tracker::QueryTracker;
+use crate::scan::ScanJob;
 
 /// Poll `.git/index.lock` until it disappears (git write completed), giving up
 /// after [`GIT_LOCK_MAX_WAIT`]. Used by [`SharedPicker::refresh_git_status`]
@@ -37,8 +38,21 @@ fn wait_for_git_index_lock_release(git_root: &Path) {
 }
 
 /// Thread-safe shared handle to the [`FilePicker`] instance.
-/// This is a main thread-safe primitive to use FFF file picker,
-/// will automatically clean all the background work on drop.
+/// This accumulates only asynchronous non-blocking operations against the
+/// file picker: creating, triggering various rescans and so on.
+///
+/// For blocking access use internal picker via `.read()` or `.write()`
+///
+/// ```ignore
+/// let shared_picker = SharedFilePicker::default();
+///
+/// if let Some(picker) = shared_picker.read()?.as_ref() {
+///     let files = picker.fuzzy_search(&query, options);
+///     println!("Found {} files", files.len());
+/// } else {
+///     println!("Picker not initialized");
+/// }
+/// ```
 #[derive(Clone, Default)]
 pub struct SharedFilePicker(pub(crate) Arc<SharedPickerInner>);
 
@@ -84,10 +98,9 @@ impl SharedFilePicker {
         Ok(self.0.picker.write())
     }
 
-    /// Produce a non-owning handle to the same inner picker. Held by
-    /// internal threads (e.g. the background watcher's owner) so they
-    /// don't extend the picker's lifetime.
-    pub(crate) fn downgrade(&self) -> WeakFilePicker {
+    /// Produce a non-owning handle to the same inner picker.
+    /// Use it if you don't need to block internal threads from dropping while owning this ref
+    pub(crate) fn weaken(&self) -> WeakFilePicker {
         WeakFilePicker(Arc::downgrade(&self.0))
     }
 
@@ -97,7 +110,7 @@ impl SharedFilePicker {
         let guard = self.0.picker.read();
         guard
             .as_ref()
-            .is_some_and(|p| p.need_enable_mmap_cache() || p.need_enable_content_indexing())
+            .is_some_and(|p| p.has_mmap_cache() || p.has_content_indexing())
     }
 
     /// Block until the background filesystem scan finishes.
@@ -106,7 +119,7 @@ impl SharedFilePicker {
         let signal = {
             let guard = self.0.picker.read();
             match &*guard {
-                Some(picker) => picker.scan_signal(),
+                Some(picker) => Arc::clone(&picker.signals.scanning),
                 None => return true,
             }
         };
@@ -124,16 +137,16 @@ impl SharedFilePicker {
     /// Block until the background file watcher is ready.
     /// Returns `true` if watcher ready, `false` on timeout.
     pub fn wait_for_watcher(&self, timeout: Duration) -> bool {
-        let signal = {
+        let watch_ready_signal = {
             let guard = self.0.picker.read();
             match &*guard {
-                Some(picker) => picker.watcher_signal(),
+                Some(picker) => Arc::clone(&picker.signals.watcher_ready),
                 None => return true,
             }
         };
 
         let start = std::time::Instant::now();
-        while !signal.load(std::sync::atomic::Ordering::Acquire) {
+        while !watch_ready_signal.load(std::sync::atomic::Ordering::Acquire) {
             if start.elapsed() >= timeout {
                 return false;
             }
@@ -143,20 +156,10 @@ impl SharedFilePicker {
     }
 
     /// Trigger a full filesystem rescan without blocking the caller.
-    ///
-    /// Delegates to the unified scan orchestrator in [`crate::scan`]. The
-    /// worker thread walks the filesystem off-lock, swaps `sync_data`
-    /// under a brief write, then applies git status, frecency, warmup,
-    /// and bigram rebuild — all off-lock aside from two µs-long writes.
-    /// Returns immediately.
-    ///
-    /// If a scan (or its post-scan phase) is already running, this call
-    /// flips the `rescan_pending` signal instead of spawning a second
-    /// one. The running scan drains the flag at the end of its
-    /// [`ScanJob::run`] and reschedules exactly one follow-up so the
-    /// request is never silently dropped.
+    /// Performs a safe async rescan. Guarantees only single active rescan per picker.
+    /// If many rescans requested the last one guaranteed to be finished.
     pub fn trigger_full_rescan_async(&self, shared_frecency: &SharedFrecency) -> Result<(), Error> {
-        match crate::scan::ScanJob::new(self, shared_frecency, /*install_watcher=*/ false)? {
+        match ScanJob::new(self, shared_frecency, /*install_watcher=*/ false)? {
             Some(job) => {
                 job.spawn();
             }

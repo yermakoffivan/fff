@@ -896,9 +896,9 @@ pub unsafe extern "C" fn fff_restart_index(
     };
 
     let (warmup_caches, content_indexing, watch, mode) = if let Some(mut picker) = guard.take() {
-        let warmup = picker.need_enable_mmap_cache();
-        let enable_content_indexing = picker.need_enable_content_indexing();
-        let watch = picker.need_watch();
+        let warmup = picker.has_mmap_cache();
+        let enable_content_indexing = picker.has_content_indexing();
+        let watch = picker.has_watcher();
         let mode = picker.mode();
 
         picker.stop_background_monitor();

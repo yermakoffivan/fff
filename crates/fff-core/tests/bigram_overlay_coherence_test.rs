@@ -757,18 +757,16 @@ fn bigram_overlay_coherence_rescan_after_git_commit() {
 
     // Phase 2: Commit and rescan.
     git_add_and_commit(base, "batch edit");
-
-    {
-        let mut guard = shared_picker.write().unwrap();
-        let picker = guard.as_mut().unwrap();
-        picker
-            .trigger_rescan(&shared_frecency)
-            .expect("trigger_rescan should succeed");
-    }
+    shared_picker
+        .trigger_full_rescan_async(&shared_frecency)
+        .expect("rescan should succeed");
 
     // After trigger_rescan, sync_data is replaced (and bigram_index dropped
     // with it). Wait for the synchronous scan to finish.
-    wait_for_scan(&shared_picker);
+    assert!(
+        shared_picker.wait_for_scan(Duration::from_secs(15)),
+        "Timed out waiting for scan to complete"
+    );
 
     // Verify the file list is refreshed: all base_count + 5 files should
     // be present as base files (not overflow, since they're committed).
@@ -893,18 +891,14 @@ fn bigram_overlay_coherence_full_lifecycle_seed_edit_commit_rescan_edit() {
 
     // -- Phase 2: Commit and rescan --
     git_add_and_commit(base, "phase 1 changes");
+    shared_picker
+        .trigger_full_rescan_async(&shared_frecency)
+        .expect("rescan should succeed");
 
-    {
-        let mut guard = shared_picker.write().unwrap();
-        let picker = guard.as_mut().unwrap();
-        picker
-            .trigger_rescan(&shared_frecency)
-            .expect("rescan should succeed");
-    }
-
-    // After rescan, bigram is dropped with old FileSync. Grep falls back
-    // to full search, which is correct.
-    wait_for_scan(&shared_picker);
+    assert!(
+        shared_picker.wait_for_scan(Duration::from_secs(15)),
+        "Timed out waiting for scan to complete"
+    );
 
     // Phase1 tokens should still be findable (now in base index).
     {
@@ -1194,14 +1188,13 @@ fn bigram_overlay_coherence_fuzzy_search_after_rescan() {
     // Commit and rescan.
     git_add_and_commit(base, "add grpc, remove web");
 
-    {
-        let mut guard = shared_picker.write().unwrap();
-        let picker = guard.as_mut().unwrap();
-        picker
-            .trigger_rescan(&shared_frecency)
-            .expect("rescan should succeed");
-    }
-    wait_for_scan(&shared_picker);
+    shared_picker
+        .trigger_full_rescan_async(&shared_frecency)
+        .expect("rescan should succeed");
+    assert!(
+        shared_picker.wait_for_scan(Duration::from_secs(15)),
+        "Timed out waiting for scan to complete"
+    );
 
     // After rescan, fuzzy search should reflect the committed state.
     {
@@ -1341,34 +1334,12 @@ fn grep_count(picker: &FilePicker, query: &str) -> usize {
 
 fn grep_without_overlay_count(picker: &FilePicker, query: &str) -> usize {
     let parsed = parse_grep_query(query);
-    picker
-        .grep_without_overlay(&parsed, &grep_opts())
-        .matches
-        .len()
+    picker.grep_original(&parsed, &grep_opts()).matches.len()
 }
 
 /// Wait for scanning to finish (no bigram requirement).
 /// Use after `trigger_rescan` which replaces sync_data but does not
 /// rebuild the bigram index.
-fn wait_for_scan(shared_picker: &SharedFilePicker) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        std::thread::sleep(Duration::from_millis(50));
-        let ready = shared_picker
-            .read()
-            .ok()
-            .map(|guard| guard.as_ref().map_or(false, |p| !p.is_scan_active()))
-            .unwrap_or(false);
-        if ready {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "Timed out waiting for scan to complete"
-        );
-    }
-}
-
 fn wait_for_bigram(shared_picker: &SharedFilePicker) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {

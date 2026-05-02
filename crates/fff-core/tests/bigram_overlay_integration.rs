@@ -36,6 +36,7 @@ fn modified_file_findable_via_overlay() {
             enable_mmap_cache: true,
             enable_content_indexing: true,
             mode: FFFMode::Neovim,
+            watch: false, // we drive events manually
             ..Default::default()
         },
     )
@@ -150,7 +151,7 @@ fn modified_file_findable_via_overlay() {
         let picker = guard.as_ref().unwrap();
         let parsed = parse_grep_query("UNIQUE_NEEDLE");
         let opts = grep_opts();
-        let result = picker.grep_without_overlay(&parsed, &opts);
+        let result = picker.grep_original(&parsed, &opts);
         assert_eq!(
             result.matches.len(),
             0,
@@ -186,6 +187,7 @@ fn deleted_file_excluded_via_overlay() {
             enable_mmap_cache: true,
             enable_content_indexing: true,
             mode: FFFMode::Neovim,
+            watch: false, // we drive events manually
             ..Default::default()
         },
     )
@@ -255,6 +257,7 @@ fn new_file_findable_after_add() {
             enable_mmap_cache: true,
             enable_content_indexing: true,
             mode: FFFMode::Neovim,
+            watch: false, // we drive events manually
             ..Default::default()
         },
     )
@@ -325,6 +328,7 @@ fn modified_file_findable_via_regex_overlay() {
             enable_mmap_cache: true,
             enable_content_indexing: true,
             mode: FFFMode::Neovim,
+            watch: false, // we drive events manually
             ..Default::default()
         },
     )
