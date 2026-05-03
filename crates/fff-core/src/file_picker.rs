@@ -2087,7 +2087,11 @@ mod tests {
     #[test]
     fn extract_watch_dirs_includes_pure_ancestor_dirs() {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
+        // On Windows the picker canonicalizes base_path with dunce; match that
+        // here so the stored dir paths line up with assertions built from
+        // `base.join(..)` (which otherwise would carry an 8.3 short name).
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
 
         // Tree:
         //   base/src/components/button.txt    (src/components has a file)

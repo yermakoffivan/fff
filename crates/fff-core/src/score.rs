@@ -495,7 +495,11 @@ fn match_and_score_in_arena<'a>(
     let has_uppercase = fuzzy_parts
         .iter()
         .any(|p| p.chars().any(|c| c.is_uppercase()));
-    let query_contains_path_separator = fuzzy_parts.iter().any(|p| p.contains(MAIN_SEPARATOR));
+    // Users type `/` regardless of platform. Checking the OS separator alone
+    // would miss forward-slash queries on Windows.
+    let query_contains_path_separator = fuzzy_parts
+        .iter()
+        .any(|p| p.contains('/') || p.contains(MAIN_SEPARATOR));
 
     let options = neo_frizbee::Config {
         max_typos: Some(context.max_typos),
