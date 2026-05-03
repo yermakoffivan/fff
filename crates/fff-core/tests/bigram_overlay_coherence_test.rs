@@ -1429,6 +1429,17 @@ fn write_file_with_token(dir: &Path, name: &str, token: &str) {
     fs::write(dir.join(name), content).unwrap();
 }
 
+/// Join path components with the platform-native separator so the produced
+/// relative path matches what the file picker's indexer stores after walking
+/// the filesystem (Windows: `\`, everything else: `/`).
+fn native_rel_path(components: &[&str]) -> String {
+    let mut pb = PathBuf::new();
+    for c in components {
+        pb.push(c);
+    }
+    pb.to_string_lossy().into_owned()
+}
+
 /// Create a realistic 200-file repository with subdirectories and diverse
 /// content. Files are split into 4 thematic groups (50 each) so that
 /// group-specific bigrams appear in ~25% of files, keeping the bigram
@@ -1438,19 +1449,26 @@ fn write_file_with_token(dir: &Path, name: &str, token: &str) {
 /// child dirs) so that the directory sort order is consistent with the
 /// binary search in `find_file_index`.
 ///
-/// Returns `Vec<(relative_path, token)>` for all 200 files.
+/// Returns `Vec<(relative_path, token)>` for all 200 files. The relative
+/// path uses the platform-native separator (matching the picker index).
 fn seed_realistic_repo(dir: &Path) -> Vec<(String, String)> {
-    let subdirs = [
-        "src/core",
-        "src/models",
-        "src/net",
-        "src/utils",
-        "tests/integration",
-        "tests/unit",
-        "lib/helpers",
-        "lib/internal",
+    // Subdir components. Joined with `PathBuf` so Windows ends up with
+    // `src\core` instead of `src/core` — otherwise the picker (which walks
+    // the filesystem and stores native separators) and the test (which
+    // stored `/` literals) would disagree and `remove_file_by_path` /
+    // `find_file_index` lookups would all miss.
+    let subdirs: [&[&str]; 8] = [
+        &["src", "core"],
+        &["src", "models"],
+        &["src", "net"],
+        &["src", "utils"],
+        &["tests", "integration"],
+        &["tests", "unit"],
+        &["lib", "helpers"],
+        &["lib", "internal"],
     ];
-    for subdir in &subdirs {
+    let subdir_paths: Vec<String> = subdirs.iter().copied().map(native_rel_path).collect();
+    for subdir in &subdir_paths {
         fs::create_dir_all(dir.join(subdir)).unwrap();
     }
 
@@ -1542,8 +1560,9 @@ fn seed_realistic_repo(dir: &Path) -> Vec<(String, String)> {
     for (group_idx, (domain, words)) in groups.iter().enumerate() {
         for file_in_group in 0..50 {
             let idx = group_idx * 50 + file_in_group;
-            let subdir = subdirs[idx % subdirs.len()];
-            let relative_path = format!("{subdir}/repo_{idx:04}.rs");
+            let subdir = &subdir_paths[idx % subdir_paths.len()];
+            let file_name = format!("repo_{idx:04}.rs");
+            let relative_path = native_rel_path(&[subdir, &file_name]);
             let token = format!("REPO_TOKEN_{idx:04}");
 
             let w1 = words[file_in_group % words.len()];
