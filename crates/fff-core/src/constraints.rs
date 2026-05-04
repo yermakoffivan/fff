@@ -40,16 +40,19 @@ pub(crate) trait Constrainable {
     fn write_relative_path(&self, arena: ArenaPtr, out: &mut String);
 }
 
-/// `\\` is the native path separator on Windows. Indexed paths keep the OS
-/// form, so treat both bytes as equivalent for constraint matching — user
-/// queries always use `/` but stored Windows paths carry backslashes.
+/// Windows stores paths with `\\`; `/` comes from user queries.
 #[inline]
 fn is_path_sep(b: u8) -> bool {
-    b == b'/' || b == b'\\'
+    #[cfg(windows)]
+    {
+        b == b'/' || b == b'\\'
+    }
+    #[cfg(not(windows))]
+    {
+        b == b'/'
+    }
 }
 
-/// Case-insensitive byte equality that also folds `/` and `\\` together so a
-/// segment like `libswscale/aarch64` matches `libswscale\\aarch64` on Windows.
 #[inline]
 fn path_slice_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -64,14 +67,7 @@ fn path_slice_eq(a: &[u8], b: &[u8]) -> bool {
     })
 }
 
-/// Check if a relative path ends with the given suffix at a path-separator
-/// boundary (case-insensitive). `\\` and `/` are treated as equivalent so
-/// Windows native paths match queries that use `/`.
-///
-/// Examples:
-/// - `path_ends_with_suffix("libswscale/input.c", "libswscale/input.c")` → true (exact)
-/// - `path_ends_with_suffix("foo/libswscale/input.c", "libswscale/input.c")` → true (suffix)
-/// - `path_ends_with_suffix("xlibswscale/input.c", "libswscale/input.c")` → false (no boundary)
+/// Path ends with suffix at a path-separator boundary (case-insensitive).
 #[inline]
 pub fn path_ends_with_suffix(path: &str, suffix: &str) -> bool {
     let path_bytes = path.as_bytes();
@@ -82,8 +78,7 @@ pub fn path_ends_with_suffix(path: &str, suffix: &str) -> bool {
 
     let start = path.len() - suffix.len();
 
-    // Must land on a char boundary — multi-byte UTF-8 can make
-    // `path.len() - suffix.len()` land inside a char.
+    // Multi-byte UTF-8 may put `start` inside a char.
     if !path.is_char_boundary(start) {
         return false;
     }
@@ -92,16 +87,14 @@ pub fn path_ends_with_suffix(path: &str, suffix: &str) -> bool {
         return false;
     }
 
-    // Exact match, or the character before is a path separator.
-    // `start` is a char boundary but `start - 1` may be inside a multi-byte
-    // char, so scan backward to find the preceding ASCII byte.
+    // Exact or preceded by a separator. Scan backward past any multi-byte
+    // continuation bytes to find the preceding ASCII byte.
     if start == 0 {
         return true;
     }
     let mut i = start;
     while i > 0 {
         i -= 1;
-        // ASCII bytes (0..128) are single-byte UTF-8 code units
         if path_bytes[i] < 128 {
             return is_path_sep(path_bytes[i]);
         }
@@ -117,23 +110,19 @@ pub fn file_has_extension(file_name: &str, ext: &str) -> bool {
         return false;
     }
     let start = name_bytes.len() - ext_bytes.len() - 1;
-    // `.` is ASCII (single byte), so `start` must be a char boundary.
-    // If it lands inside a multi-byte char the extension can't match.
     if start > 0 && !file_name.is_char_boundary(start) {
         return false;
     }
     name_bytes.get(start) == Some(&b'.') && name_bytes[start + 1..].eq_ignore_ascii_case(ext_bytes)
 }
 
-/// Supports multi-segment paths like "libswscale/aarch64" (consecutive components).
-/// `/` and `\\` are equivalent so Windows native paths match `/`-based queries.
+/// Matches multi-segment queries like `libswscale/aarch64`.
 #[inline]
 pub fn path_contains_segment(path: &str, segment: &str) -> bool {
     let path_bytes = path.as_bytes();
     let segment_bytes = segment.as_bytes();
     let segment_len = segment_bytes.len();
 
-    // Check segment/ at start of path
     if path_bytes.len() > segment_len
         && is_path_sep(path_bytes[segment_len])
         && path.is_char_boundary(segment_len)
@@ -142,7 +131,6 @@ pub fn path_contains_segment(path: &str, segment: &str) -> bool {
         return true;
     }
 
-    // Check /segment/ anywhere using byte scanning
     if path_bytes.len() < segment_len + 2 {
         return false;
     }
@@ -568,9 +556,9 @@ mod tests {
         assert!(!path_contains_segment("src", "src")); // no trailing slash
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_path_contains_segment_accepts_backslash() {
-        // Windows stores paths with `\\`; queries always use `/`. Both must match.
         assert!(path_contains_segment("src\\lib.rs", "src"));
         assert!(path_contains_segment(
             "app\\modules\\src\\services\\x.lua",
@@ -578,8 +566,6 @@ mod tests {
         ));
         assert!(path_contains_segment("app\\SRC\\x.lua", "src"));
 
-        // Multi-segment queries too — `libswscale/aarch64` must match
-        // `libswscale\\aarch64` when the stored path uses backslashes.
         assert!(path_contains_segment(
             "foo\\libswscale\\aarch64\\input.S",
             "libswscale/aarch64"
@@ -589,7 +575,6 @@ mod tests {
             "fff-core/src"
         ));
 
-        // Still rejects partial matches regardless of separator.
         assert!(!path_contains_segment("mysrc\\lib.rs", "src"));
         assert!(!path_contains_segment(
             "xlibswscale\\aarch64\\in.S",
@@ -641,9 +626,9 @@ mod tests {
         assert!(path_ends_with_suffix("crates/src/main.rs", "src/main.rs"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_path_ends_with_suffix_accepts_backslash() {
-        // Windows backslash paths must match forward-slash suffixes.
         assert!(path_ends_with_suffix(
             "app\\modules\\src\\services\\handler.lua",
             "services/handler.lua"
@@ -652,7 +637,6 @@ mod tests {
             "foo\\libswscale\\input.c",
             "libswscale/input.c"
         ));
-        // Still rejects non-boundary matches on Windows paths.
         assert!(!path_ends_with_suffix(
             "xlibswscale\\input.c",
             "libswscale/input.c"
