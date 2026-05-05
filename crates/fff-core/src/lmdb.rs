@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use heed::{Env, EnvOpenOptions};
+use heed::{Database, Env, EnvOpenOptions};
 
 use crate::error::{Error, Result};
 
@@ -31,10 +31,39 @@ pub(crate) trait LmdbStore {
             opts.open(db_path).map_err(Error::EnvOpen)?
         };
 
-        env.clear_stale_readers()
-            .map_err(Error::DbClearStaleReaders)?;
-
         Ok(env)
+    }
+
+    /// Open or create a database without blocking on the LMDB writer mutex
+    /// when the database already exists.
+    fn open_database_safe<KC, DC>(env: &Env, name: Option<&str>) -> Result<Database<KC, DC>>
+    where
+        KC: 'static,
+        DC: 'static,
+    {
+        let rtxn = env.read_txn().map_err(Error::DbStartReadTxn)?;
+        let maybe_db: Option<Database<KC, DC>> =
+            env.open_database(&rtxn, name).map_err(Error::DbOpen)?;
+
+        // do not drop the DB here
+        rtxn.commit().map_err(Error::DbCommit)?;
+
+        match maybe_db {
+            Some(db) => Ok(db),
+            None => {
+                // First time: create the database (requires write lock).
+                // unfortunately this CAN be deadlocking and this is what we see happens
+                // if the other part of the code is segfaulting, so the only rule to prevent this
+                // write the good code mf, okay?
+                let mut wtxn = env.write_txn().map_err(Error::DbStartWriteTxn)?;
+                let db = env
+                    .create_database(&mut wtxn, name)
+                    .map_err(Error::DbCreate)?;
+
+                wtxn.commit().map_err(Error::DbCommit)?;
+                Ok(db)
+            }
+        }
     }
 
     fn erase_if_oversized(db_path: &Path) {
