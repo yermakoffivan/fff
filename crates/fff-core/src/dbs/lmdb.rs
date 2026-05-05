@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 use heed::{Database, Env, EnvOpenOptions};
 
@@ -7,6 +9,18 @@ use crate::error::{Error, Result};
 
 pub(crate) fn is_map_full(err: &heed::Error) -> bool {
     matches!(err, heed::Error::Mdb(heed::MdbError::MapFull))
+}
+
+// Concurrent `mdb_env_open` calls on the same path can race on macOS
+// this is for some reason fixabtly by simple retry of the open
+fn is_transient_env_open_error(err: &heed::Error) -> bool {
+    match err {
+        heed::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+        ),
+        _ => false,
+    }
 }
 
 pub(crate) trait LmdbStore {
@@ -22,16 +36,34 @@ pub(crate) trait LmdbStore {
         Self::erase_if_oversized(db_path);
         fs::create_dir_all(db_path).map_err(Error::CreateDir)?;
 
-        let env = unsafe {
-            let mut opts = EnvOpenOptions::new();
-            opts.map_size(Self::MAP_SIZE);
-            if Self::MAX_DBS > 0 {
-                opts.max_dbs(Self::MAX_DBS);
-            }
-            opts.open(db_path).map_err(Error::EnvOpen)?
-        };
+        const MAX_ATTEMPTS: u32 = 8;
+        let mut attempt = 0u32;
+        loop {
+            let result = unsafe {
+                let mut opts = EnvOpenOptions::new();
+                opts.map_size(Self::MAP_SIZE);
+                if Self::MAX_DBS > 0 {
+                    opts.max_dbs(Self::MAX_DBS);
+                }
+                opts.open(db_path)
+            };
 
-        Ok(env)
+            match result {
+                Ok(env) => return Ok(env),
+                Err(e) if is_transient_env_open_error(&e) && attempt + 1 < MAX_ATTEMPTS => {
+                    attempt += 1;
+                    tracing::debug!(
+                        path = %db_path.display(),
+                        attempt,
+                        error = ?e,
+                        "transient LMDB env open error, retrying"
+                    );
+
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(Error::EnvOpen(e)),
+            }
+        }
     }
 
     /// Open or create a database without blocking on the LMDB writer mutex

@@ -187,9 +187,13 @@ fn child_open_close_loop(db_path: &str, iterations: usize, idx: usize, is_writer
     for i in 0..iterations {
         let tracker = match QueryTracker::open(Path::new(db_path)) {
             Ok(t) => t,
-            Err(_) => return CHILD_OPEN_FAILED,
+            Err(e) => {
+                eprintln!("child {idx} iter {i} reader open failed: {e:?}");
+                return CHILD_OPEN_FAILED;
+            }
         };
-        if tracker.get_historical_query(project, 0).is_err() {
+        if let Err(e) = tracker.get_historical_query(project, 0) {
+            eprintln!("child {idx} iter {i} read failed: {e:?}");
             return CHILD_READ_FAILED;
         }
         drop(tracker);
@@ -197,13 +201,14 @@ fn child_open_close_loop(db_path: &str, iterations: usize, idx: usize, is_writer
         if is_writer {
             let mut tracker = match QueryTracker::open(Path::new(db_path)) {
                 Ok(t) => t,
-                Err(_) => return CHILD_OPEN_FAILED,
+                Err(e) => {
+                    eprintln!("child {idx} iter {i} writer open failed: {e:?}");
+                    return CHILD_OPEN_FAILED;
+                }
             };
             let file = PathBuf::from(format!("/test/project/c{idx}_{i}.rs"));
-            if tracker
-                .track_query_completion(&format!("q{idx}_{i}"), project, &file)
-                .is_err()
-            {
+            if let Err(e) = tracker.track_query_completion(&format!("q{idx}_{i}"), project, &file) {
+                eprintln!("child {idx} iter {i} write failed: {e:?}");
                 return CHILD_WRITE_FAILED;
             }
             drop(tracker);
@@ -237,7 +242,7 @@ fn spawn_open_close_children(
                 .env_remove("RUST_LOG")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
                 .spawn()
                 .expect("spawn child")
         })

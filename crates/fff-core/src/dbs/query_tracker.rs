@@ -1,6 +1,6 @@
-use crate::db_healthcheck::DbHealthChecker;
+use super::db_healthcheck::DbHealthChecker;
+use super::lmdb::{LmdbStore, is_map_full};
 use crate::error::Error;
-use crate::lmdb::{LmdbStore, is_map_full};
 use heed::types::{Bytes, SerdeBincode};
 use heed::{Database, Env};
 use serde::{Deserialize, Serialize};
