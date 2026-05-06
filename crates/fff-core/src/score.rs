@@ -541,6 +541,8 @@ fn match_and_score_in_arena<'a>(
         },
     };
 
+    let t0 = std::time::Instant::now();
+
     let path_matches = match_fuzzy_parts(
         fuzzy_parts,
         &working_files,
@@ -548,6 +550,8 @@ fn match_and_score_in_arena<'a>(
         context.max_threads,
         arena,
     );
+
+    let t1 = std::time::Instant::now();
 
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;
@@ -771,6 +775,16 @@ fn match_and_score_in_arena<'a>(
             (file, score)
         })
         .collect();
+
+    let t2 = std::time::Instant::now();
+
+    tracing::info!(
+        simd_match_ms = t1.duration_since(t0).as_millis(),
+        scoring_ms = t2.duration_since(t1).as_millis(),
+        path_matches_count = results.len(),
+        total_files = files.len(),
+        "score.rs phase breakdown"
+    );
 
     results
 }
