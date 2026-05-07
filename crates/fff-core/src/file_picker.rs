@@ -74,11 +74,10 @@ pub(crate) static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock
     let total = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(4);
-    let bg_threads = total.saturating_sub(2).max(1);
-    info!(
-        "Background pool: {} threads (system has {})",
-        bg_threads, total
-    );
+
+    // benchmarks show that most of the work background tasks spend on waiting for syscalls,
+    // by halfing available parallelism we loose some performance, but it is mostly nothing
+    let bg_threads = (total / 2).max(2);
     rayon::ThreadPoolBuilder::new()
         .num_threads(bg_threads)
         .thread_name(|i| format!("fff-bg-{i}"))
@@ -753,6 +752,17 @@ impl FilePicker {
 
         {
             let mut guard = shared_picker.write()?;
+            // If the old picker has a post-scan in flight, wait for it to
+            // finish. cancel() was already called so the rayon loop exits
+            // within microseconds (each worker checks cancelled per item).
+            if let Some(ref old_picker) = *guard {
+                let flag = Arc::clone(&old_picker.signals.post_scan_indexing_active);
+                drop(guard);
+                while flag.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                guard = shared_picker.write()?;
+            }
             *guard = Some(picker);
         }
 
@@ -1293,7 +1303,7 @@ impl FilePicker {
             indexable_count: self.sync_data.indexable_count,
             base_path: self.base_path.clone(),
             budget: Arc::clone(&self.cache_budget),
-            // to clear automatically
+            cancelled: Arc::clone(&self.signals.cancelled),
             post_scan_flag: Arc::clone(&self.signals.post_scan_indexing_active),
         })
     }
@@ -1671,6 +1681,7 @@ pub(crate) struct PostScanUnsafeSnapshot {
     pub base_count: usize,
     pub indexable_count: usize,
     pub base_path: PathBuf,
+    pub cancelled: Arc<AtomicBool>,
     post_scan_flag: Arc<AtomicBool>,
 }
 

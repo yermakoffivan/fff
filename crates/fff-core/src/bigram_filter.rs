@@ -631,34 +631,57 @@ pub(crate) fn build_bigram_index(
     budget: &crate::types::ContentCacheBudget,
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
+    warmup: bool,
 ) -> (BigramFilter, Vec<usize>) {
     let start = std::time::Instant::now();
-    tracing::info!("Building bigram index for {} files...", files.len());
+    tracing::info!(
+        "Building bigram index for {} files (warmup={})",
+        files.len(),
+        warmup,
+    );
 
     let builder = BigramIndexBuilder::new(files.len());
     let skip_builder = BigramIndexBuilder::new(files.len());
 
-    // this does remove a memcpy for every single file + actually reducing open time on macos
     #[cfg(unix)]
     let base_fd: libc::c_int = open_base_dir_fd(base_path);
     #[cfg(not(unix))]
     let base_fd: i32 = -1;
 
-    // `content_binary` is only touched from the Binary branch below, so
-    // the mutex is cold in practice. A lock-free collector wasn't worth
-    // the complexity.
     let content_binary: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
-    crate::file_picker::BACKGROUND_THREAD_POOL.install(|| {
-        files
-            .par_chunks(BIGRAM_CHUNK_FILES)
-            .enumerate()
-            .for_each(|(chunk_idx, chunk)| {
-                let base_idx = chunk_idx * BIGRAM_CHUNK_FILES;
-                for (offset, file) in chunk.iter().enumerate() {
-                    let file_idx = base_idx + offset;
+    // When warmup is enabled, process high-frecency files first so they
+    // fill the limited cache budget before lower-priority files consume it.
+    // This replaces the separate warmup_mmaps pass with zero extra syscalls.
+    if warmup {
+        let max_files = budget.max_files;
+        // Partition indices: top `max_files` by frecency go first.
+        let mut indices: Vec<usize> = (0..files.len()).collect();
+        if indices.len() > max_files {
+            indices.select_nth_unstable_by(max_files, |&a, &b| {
+                let fa = &files[a];
+                let fb = &files[b];
+                let a_ok = !fa.is_binary() && fa.size > 0;
+                let b_ok = !fb.is_binary() && fb.size > 0;
+                match (a_ok, b_ok) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    (false, false) => std::cmp::Ordering::Equal,
+                    (true, true) => fb.total_frecency_score().cmp(&fa.total_frecency_score()),
+                }
+            });
+        }
+
+        // Process priority files first (fills cache), then the rest.
+        let priority_count = max_files.min(indices.len());
+        let (priority, rest) = indices.split_at(priority_count);
+
+        crate::file_picker::BACKGROUND_THREAD_POOL.install(|| {
+            // Phase 1: high-frecency files fill the cache budget.
+            priority.par_chunks(BIGRAM_CHUNK_FILES).for_each(|chunk| {
+                for &file_idx in chunk {
                     let outcome = process_file(
-                        file,
+                        &files[file_idx],
                         file_idx,
                         &builder,
                         &skip_builder,
@@ -672,12 +695,56 @@ pub(crate) fn build_bigram_index(
                     }
                 }
             });
-    });
+
+            // Phase 2: remaining files (cache budget likely exhausted, uses openat).
+            rest.par_chunks(BIGRAM_CHUNK_FILES).for_each(|chunk| {
+                for &file_idx in chunk {
+                    let outcome = process_file(
+                        &files[file_idx],
+                        file_idx,
+                        &builder,
+                        &skip_builder,
+                        base_fd,
+                        base_path,
+                        arena,
+                        budget,
+                    );
+                    if matches!(outcome, FileOutcome::Binary) {
+                        content_binary.lock().unwrap().push(file_idx);
+                    }
+                }
+            });
+        });
+    } else {
+        // No warmup: process in natural order (no cache priority needed).
+        crate::file_picker::BACKGROUND_THREAD_POOL.install(|| {
+            files
+                .par_chunks(BIGRAM_CHUNK_FILES)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base_idx = chunk_idx * BIGRAM_CHUNK_FILES;
+                    for (offset, file) in chunk.iter().enumerate() {
+                        let file_idx = base_idx + offset;
+                        let outcome = process_file(
+                            file,
+                            file_idx,
+                            &builder,
+                            &skip_builder,
+                            base_fd,
+                            base_path,
+                            arena,
+                            budget,
+                        );
+                        if matches!(outcome, FileOutcome::Binary) {
+                            content_binary.lock().unwrap().push(file_idx);
+                        }
+                    }
+                });
+        });
+    }
 
     #[cfg(unix)]
     if base_fd >= 0 {
-        // SAFETY: we opened `base_fd` at the top of this function and
-        // no worker still references it once the rayon pool joined.
         unsafe { libc::close(base_fd) };
     }
 
@@ -688,9 +755,6 @@ pub(crate) fn build_bigram_index(
     let skip_index = skip_builder.compress(Some(SKIP_INDEX_MIN_DENSITY_PCT));
     index.set_skip_index(skip_index);
 
-    // Builder buffers were freed by `compress()` above (one deallocation
-    // each); nudge mimalloc to return them (and any transient allocs)
-    // to the OS.
     crate::file_picker::hint_allocator_collect();
 
     tracing::info!(

@@ -114,6 +114,44 @@ impl SharedFilePicker {
             .is_some_and(|p| p.has_mmap_cache() || p.has_content_indexing())
     }
 
+    /// Block until post-scan indexing (bigram + warmup) finishes.
+    pub fn wait_for_post_scan(&self, timeout: Duration) -> bool {
+        let signal = {
+            let guard = self.0.picker.read();
+            match &*guard {
+                Some(picker) => Arc::clone(&picker.signals.post_scan_indexing_active),
+                None => return true,
+            }
+        };
+
+        let start = std::time::Instant::now();
+        // The post_scan_indexing_active flag cycles twice:
+        // once for git+frecency, once for warmup+bigram. We need to wait for
+        // both cycles. Strategy: keep waiting until it's been inactive for a
+        // sustained period indicating no more work is coming.
+        let mut saw_active = false;
+        let mut last_inactive_at: Option<std::time::Instant> = None;
+
+        loop {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+
+            let active = signal.load(std::sync::atomic::Ordering::Acquire);
+            if active {
+                saw_active = true;
+                last_inactive_at = None;
+            } else if saw_active {
+                // Flag went inactive. Wait 200ms to confirm it doesn't reactivate.
+                let inactive_since = last_inactive_at.get_or_insert_with(std::time::Instant::now);
+                if inactive_since.elapsed() > Duration::from_millis(200) {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Block until the background filesystem scan finishes.
     /// Returns `true` if scan completed, `false` on timeout.
     pub fn wait_for_scan(&self, timeout: Duration) -> bool {

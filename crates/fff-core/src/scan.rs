@@ -216,14 +216,22 @@ impl ScanJob {
             rescubscribe_watcher_post_scan(&shared_picker);
         }
 
-        // 3. Apply git status from the parallel index. This is very fast and doesn't lock
+        // 3. Post-scan warmup + bigram build.
+        // Run BEFORE git status join so bigram I/O overlaps with the
+        // git-status thread (which can take 10+ seconds on huge repos).
+        if (config.warmup || config.content_indexing) && !signals.cancelled.load(Ordering::Acquire)
+        {
+            Self::run_post_scan(&shared_picker, &signals, &config);
+        }
+
+        // 4. Apply git status + frecency off-lock (joins the git thread).
         if !signals.cancelled.load(Ordering::Acquire)
             && let Some(status_handle) = status_handle
         {
             apply_git_status_and_frecency(&shared_picker, &shared_frecency, status_handle, mode);
         }
 
-        // 4. Install filesystem watcher (initial scan only).
+        // 5. Install filesystem watcher (initial scan only).
         if config.install_watcher && config.watch && !signals.cancelled.load(Ordering::Acquire) {
             let shared_picker: &SharedFilePicker = &shared_picker;
             let shared_frecency: &SharedFrecency = &shared_frecency;
@@ -245,12 +253,6 @@ impl ScanJob {
                 }
                 Err(e) => error!(?e, "failed to initialize background watcher"),
             };
-        }
-
-        // 5. Post-scan warmup + bigram build.
-        if (config.warmup || config.content_indexing) && !signals.cancelled.load(Ordering::Acquire)
-        {
-            Self::run_post_scan(&shared_picker, &signals, &config);
         }
 
         // 6. Drain any rescan that arrived while we were busy.
@@ -307,14 +309,16 @@ impl ScanJob {
         let budget: &ContentCacheBudget = &unsafe_snapshot.budget;
         let files: &[crate::types::FileItem] = &unsafe_snapshot.files[..unsafe_snapshot.base_count];
 
-        if config.warmup && !signals.cancelled.load(Ordering::Acquire) {
-            warmup_mmaps(files, budget, &unsafe_snapshot.base_path, arena);
-        }
-
         if config.content_indexing && !signals.cancelled.load(Ordering::Acquire) {
+            // Unified pass: bigram indexing + warmup cache fill in one sweep.
             let indexable_files = &files[..unsafe_snapshot.indexable_count.min(files.len())];
-            let (index, content_binary) =
-                build_bigram_index(indexable_files, budget, &unsafe_snapshot.base_path, arena);
+            let (index, content_binary) = build_bigram_index(
+                indexable_files,
+                budget,
+                &unsafe_snapshot.base_path,
+                arena,
+                config.warmup,
+            );
 
             if let Ok(mut guard) = shared_picker.write()
                 && let Some(picker) = guard.as_mut()
@@ -326,6 +330,9 @@ impl ScanJob {
                 }
                 picker.set_bigram_index(index, BigramOverlay::new(unsafe_snapshot.indexable_count));
             }
+        } else if config.warmup && !signals.cancelled.load(Ordering::Acquire) {
+            // Warmup-only: no bigram indexing, just fill the mmap cache.
+            warmup_mmaps(files, budget, &unsafe_snapshot.base_path, arena);
         }
     }
 }
@@ -425,6 +432,10 @@ fn apply_git_status_and_frecency(
 
     BACKGROUND_THREAD_POOL.install(|| {
         files.par_iter_mut().for_each(|file| {
+            if unsafe_snapshot.cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+
             let mut buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
             let absolute_path =
                 file.write_absolute_path(arena, &unsafe_snapshot.base_path, &mut buf);
