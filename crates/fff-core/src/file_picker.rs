@@ -1594,6 +1594,12 @@ impl FilePicker {
         self.signals.scanning.load(Ordering::Relaxed)
     }
 
+    pub fn is_post_scan_active(&self) -> bool {
+        self.signals
+            .post_scan_indexing_active
+            .load(Ordering::Acquire)
+    }
+
     /// Return a clone of the watcher-ready flag so callers can poll it without
     /// holding a lock on the picker.
     pub fn watcher_signal(&self) -> Arc<AtomicBool> {
