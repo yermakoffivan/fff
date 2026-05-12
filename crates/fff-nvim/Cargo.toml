@@ -79,6 +79,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 
 [[bench]]
 name = "indexing_and_search"
+path = "benches/fuzzy_seearch_bench.rs"
 harness = false
 
 [[bench]]
@@ -91,4 +92,5 @@ harness = false
 
 [[bench]]
 name = "post_scan_bench"
+path = "benches/scan_bench.rs"
 harness = false

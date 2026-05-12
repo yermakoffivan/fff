@@ -56,7 +56,7 @@ fn wait_for_post_scan(sp: &SharedFilePicker, timeout: Duration) -> bool {
             .and_then(|guard| {
                 guard
                     .as_ref()
-                    .map(|p| !p.is_scan_active() && p.bigram_index().is_some())
+                    .map(|p| !p.is_scan_active() && !p.is_post_scan_active())
             })
             .unwrap_or(false);
         if ready {

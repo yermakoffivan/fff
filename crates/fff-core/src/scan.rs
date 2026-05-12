@@ -6,11 +6,12 @@
 //!
 //!   1. walk filesystem off-lock
 //!   2. swap `sync_data` under a brief write
-//!   3. apply git status + frecency off-lock
-//!   4. (optional, initial scan only) spawn the filesystem watcher
-//!   5. (optional) post-scan: auto-size cache budget, warmup, bigram
+//!   3. apply git status + frecency off-lock (joins the git thread)
+//!   4. (optional) post-scan: warmup + bigram — git_status is already
+//!      populated at this point so the indexer can skip dirty files
+//!   5. (optional, initial scan only) spawn the filesystem watcher
 //!
-//! The picker write lock is held only in step 2 and step 5's index
+//! The picker write lock is held only in step 2 and step 4's index
 //! install — both O(µs-ms), never seconds. Every other FFI caller on
 //! the nvim main thread keeps running.
 //!
@@ -199,7 +200,12 @@ impl ScanJob {
                 return;
             }
 
+            let live_count = sync.live_count;
             picker.commit_new_sync(sync);
+
+            if config.auto_cache_budget && !picker.has_explicit_cache_budget() {
+                picker.set_cache_budget(ContentCacheBudget::new_for_repo(live_count));
+            }
         } else {
             error!("failed to install scan results into picker");
             return;
@@ -216,20 +222,36 @@ impl ScanJob {
             rescubscribe_watcher_post_scan(&shared_picker);
         }
 
-        // 3. Post-scan warmup + bigram build.
-        // Run BEFORE git status join so bigram I/O overlaps with the
-        // git-status thread (which can take 10+ seconds on huge repos).
-        if (config.warmup || config.content_indexing) && !signals.cancelled.load(Ordering::Acquire)
-        {
-            Self::run_post_scan(&shared_picker, &signals, &config);
-        }
+        let mut snapshot = if !signals.cancelled.load(Ordering::Acquire) {
+            shared_picker.read().ok().and_then(|guard| {
+                guard
+                    .as_ref()
+                    .and_then(|picker| unsafe { picker.post_scan_snapshot() })
+            })
+        } else {
+            None
+        };
 
-        // 4. Apply git status + frecency off-lock (joins the git thread).
+        // 3. Apply git status + frecency off-lock (joins the git thread).
+        // Done BEFORE the bigram/warmup pass so `FileItem::git_status` is
+        // populated when the indexer decides which files to pin in the
+        // mmap cache (dirty files stay hot in the page cache on their own).
         if !signals.cancelled.load(Ordering::Acquire)
             && let Some(status_handle) = status_handle
+            && let Some(snap) = snapshot.as_mut()
         {
-            apply_git_status_and_frecency(&shared_picker, &shared_frecency, status_handle, mode);
+            apply_git_status_and_frecency(&shared_frecency, status_handle, mode, snap);
         }
+
+        // 4. Post-scan warmup + bigram build.
+        if (config.warmup || config.content_indexing)
+            && !signals.cancelled.load(Ordering::Acquire)
+            && let Some(snap) = snapshot.as_ref()
+        {
+            Self::run_post_scan(&shared_picker, &signals, &config, snap);
+        }
+
+        drop(snapshot);
 
         // 5. Install filesystem watcher (initial scan only).
         if config.install_watcher && config.watch && !signals.cancelled.load(Ordering::Acquire) {
@@ -279,28 +301,12 @@ impl ScanJob {
     }
 
     #[tracing::instrument(skip_all)]
-    fn run_post_scan(shared_picker: &SharedFilePicker, signals: &ScanSignals, config: &ScanConfig) {
-        // Auto-scale the cache budget before we take the files snapshot
-        if config.auto_cache_budget
-            && !signals.cancelled.load(Ordering::Acquire)
-            && let Ok(mut guard) = shared_picker.write()
-            && let Some(picker) = guard.as_mut()
-            && !picker.has_explicit_cache_budget()
-        {
-            let file_count = picker.get_files().len();
-            picker.set_cache_budget(ContentCacheBudget::new_for_repo(file_count));
-        }
-
-        // we do unsafe dirty capturing here because we GUARANTEE that the files vec is not moving anywhere
-        let Some(unsafe_snapshot) = shared_picker.read().ok().and_then(|guard| {
-            guard
-                .as_ref()
-                .and_then(|picker| unsafe { picker.post_scan_snapshot() })
-        }) else {
-            tracing::error!("Failed to commit post scan reindexing job");
-            return;
-        };
-
+    fn run_post_scan(
+        shared_picker: &SharedFilePicker,
+        signals: &ScanSignals,
+        config: &ScanConfig,
+        unsafe_snapshot: &crate::file_picker::PostScanUnsafeSnapshot,
+    ) {
         let arena = unsafe_snapshot
             .arena
             .as_ref()
@@ -309,10 +315,10 @@ impl ScanJob {
         let budget: &ContentCacheBudget = &unsafe_snapshot.budget;
         let files: &[crate::types::FileItem] = &unsafe_snapshot.files[..unsafe_snapshot.base_count];
 
+        // unified bigram and warmup_mmaps in one go, it's important to reuse open files as much as possible 
         if config.content_indexing && !signals.cancelled.load(Ordering::Acquire) {
-            // Unified pass: bigram indexing + warmup cache fill in one sweep.
             let indexable_files = &files[..unsafe_snapshot.indexable_count.min(files.len())];
-            let (index, content_binary) = build_bigram_index(
+            let index = build_bigram_index(
                 indexable_files,
                 budget,
                 &unsafe_snapshot.base_path,
@@ -323,11 +329,6 @@ impl ScanJob {
             if let Ok(mut guard) = shared_picker.write()
                 && let Some(picker) = guard.as_mut()
             {
-                for &idx in &content_binary {
-                    if let Some(file) = picker.get_file_mut(idx) {
-                        file.set_binary(true);
-                    }
-                }
                 picker.set_bigram_index(index, BigramOverlay::new(unsafe_snapshot.indexable_count));
             }
         } else if config.warmup && !signals.cancelled.load(Ordering::Acquire) {
@@ -386,10 +387,10 @@ fn rescubscribe_watcher_post_scan(shared_picker: &SharedFilePicker) {
 }
 
 fn apply_git_status_and_frecency(
-    shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
     git_handle: std::thread::JoinHandle<Option<GitStatusCache>>,
     mode: FFFMode,
+    unsafe_snapshot: &mut crate::file_picker::PostScanUnsafeSnapshot,
 ) {
     let git_cache = match git_handle.join() {
         Ok(Some(cache)) => cache,
@@ -398,17 +399,6 @@ fn apply_git_status_and_frecency(
             error!("Git status thread panicked");
             return;
         }
-    };
-
-    // Safety:
-    // apply_git_status_and_frecency is not causing any reallocas, does only sparse
-    // disjoint updates which is absolutely safe
-    let Some(mut unsafe_snapshot) = shared_picker.read().ok().and_then(|guard| {
-        guard
-            .as_ref()
-            .and_then(|picker| unsafe { picker.post_scan_snapshot() })
-    }) else {
-        return;
     };
 
     let frecency = shared_frecency.read().ok();

@@ -1547,7 +1547,7 @@ fn fuzzy_grep_search<'a>(
     abort_signal: &AtomicBool,
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
-    _overflow_arena: crate::simd_path::ArenaPtr,
+    overflow_arena: crate::simd_path::ArenaPtr,
 ) -> GrepResult<'a> {
     // max_typos controls how many *needle* characters can be unmatched.
     // A transposition (e.g. "shcema" → "schema") costs ~1 typo with
@@ -1655,7 +1655,9 @@ fn fuzzy_grep_search<'a>(
                     return None;
                 }
 
-                let file_bytes = file.get_content_for_search(buf, arena, base_path, budget)?;
+
+                let file_arena = if file.is_overflow() { overflow_arena } else { arena };
+                let file_bytes = file.get_content_for_search(buf, file_arena, base_path, budget)?;
 
                 // File-level prefilter: check if enough distinct needle chars
                 // exist anywhere in the file bytes.  Uses memchr for speed.

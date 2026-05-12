@@ -56,7 +56,7 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, LazyLock,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread::JoinHandle;
 use std::time::SystemTime;
@@ -137,7 +137,7 @@ pub(crate) struct FileSync {
     indexable_count: usize,
     base_count: usize,
     /// Number of active present files that exists in the file system
-    live_count: usize,
+    pub(crate) live_count: usize,
     /// Sorted directory table. `StableVec` so post-scan snapshots can keep
     /// the allocation alive across a picker drop without copying, and so
     /// concurrent readers observe a consistent view via the same shared
@@ -752,24 +752,12 @@ impl FilePicker {
 
         {
             let mut guard = shared_picker.write()?;
-            // If the old picker has a post-scan in flight, wait for it to
-            // finish. cancel() was already called so the rayon loop exits
-            // within microseconds (each worker checks cancelled per item).
-            if let Some(ref old_picker) = *guard {
-                let flag = Arc::clone(&old_picker.signals.post_scan_indexing_active);
-                drop(guard);
-                while flag.load(Ordering::Acquire) {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                guard = shared_picker.write()?;
-            }
             *guard = Some(picker);
+            // by dropping the old picker if it exists we triggering
+            // it's internal `cancelled` flag flip which will automatically clean
+            // any thread that might be capturing the reference safely & unsfaely
         }
 
-        // `ScanJob::spawn` flips `scanning=true` synchronously before handing
-        // off to the worker thread, so callers that invoke `wait_for_scan`
-        // immediately after `new_with_shared_state` are guaranteed to see
-        // the scan in progress.
         ScanJob::new_initial(
             shared_picker,
             shared_frecency,
@@ -1283,17 +1271,14 @@ impl FilePicker {
         if self
             .signals
             .post_scan_indexing_active
-            .load(Ordering::Acquire)
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
             tracing::error!(
                 "Can not acquire post scan unsafe snapshot, someone already acquired it"
             );
             return None;
         }
-
-        self.signals
-            .post_scan_indexing_active
-            .store(true, Ordering::Release);
 
         Some(PostScanUnsafeSnapshot {
             files: self.sync_data.files.clone(),
@@ -1654,6 +1639,14 @@ fn canonical_relative_path(path: &Path, base: &Path) -> Option<String> {
     rel.to_str().map(str::to_owned)
 }
 
+impl Drop for FilePicker {
+    fn drop(&mut self) {
+        // Cancel any in-flight ScanJob bound to this picker's signals so
+        // it cannot mutate the replacement picker after a swap.
+        self.signals.cancelled.store(true, Ordering::Release);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum FileSlot {
     Base(usize),
@@ -1713,76 +1706,6 @@ pub struct ScanProgress {
     pub is_scanning: bool,
     pub is_watcher_ready: bool,
     pub is_warmup_complete: bool,
-}
-
-/// Pre-populate mmap caches for the most valuable files so the first grep
-/// search doesn't pay the mmap creation + page fault cost.
-///
-/// All files are collected once, then an O(n) `select_nth_unstable_by`
-/// partitions the top [`MAX_CACHED_CONTENT_FILES`] highest-frecency eligible
-/// files to the front (binary / empty files are pushed to the end by the
-/// comparator). The selected prefix is warmed in parallel via rayon.
-///
-/// Files beyond the budget are still available via temporary mmaps on first
-/// grep access, so correctness is unaffected.
-#[tracing::instrument(skip(files), name = "warmup_mmaps", level = Level::DEBUG)]
-pub(crate) fn warmup_mmaps(
-    files: &[FileItem],
-    budget: &ContentCacheBudget,
-    base_path: &Path,
-    arena: ArenaPtr,
-) {
-    let max_files = budget.max_files;
-    let max_bytes = budget.max_bytes;
-    let max_file_size = budget.max_file_size;
-
-    // Single collect — no pre-filter. The comparator in select_nth pushes
-    // ineligible files (binary, empty) to the tail automatically.
-    let mut all: Vec<&FileItem> = files.iter().collect();
-
-    // O(n) partial sort: top max_files eligible-by-frecency files land in
-    // all[..max_files]. Ineligible files compare as "lowest priority" so
-    // they naturally sink past the partition boundary.
-    if all.len() > max_files {
-        all.select_nth_unstable_by(max_files, |a, b| {
-            let a_ok = !a.is_binary() && a.size > 0;
-            let b_ok = !b.is_binary() && b.size > 0;
-            match (a_ok, b_ok) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                (false, false) => std::cmp::Ordering::Equal,
-                (true, true) => b.total_frecency_score().cmp(&a.total_frecency_score()),
-            }
-        });
-    }
-
-    let to_warm = &all[..all.len().min(max_files)];
-
-    let warmed_bytes = AtomicU64::new(0);
-    let budget_exhausted = AtomicBool::new(false);
-
-    BACKGROUND_THREAD_POOL.install(|| {
-        to_warm.par_iter().for_each(|file| {
-            if budget_exhausted.load(Ordering::Relaxed) {
-                return;
-            }
-
-            if file.is_binary() || file.size == 0 || file.size > max_file_size {
-                return;
-            }
-
-            // Byte budget.
-            let prev_bytes = warmed_bytes.fetch_add(file.size, Ordering::Relaxed);
-            if prev_bytes + file.size > max_bytes {
-                budget_exhausted.store(true, Ordering::Relaxed);
-                return;
-            }
-
-            if let Some(content) = file.get_content(arena, base_path, budget) {
-                let _ = std::hint::black_box(content.first());
-            }
-        });
-    });
 }
 
 impl FileSync {
@@ -1941,12 +1864,15 @@ impl FileSync {
         // (one per partition) to preserve O(log n) lookups.
         //
         // "Indexable" = can possibly contribute bigrams: not binary-by-extension,
-        // non-zero size, not larger than the bigram/mmap cap. The cap matches
-        // `ContentCacheBudget::max_file_size` default (10 MB) — any file above
-        // that is skipped by `build_bigram_index` anyway.
-        const BIGRAM_ELIGIBLE_MAX_SIZE: u64 = 10 * 1024 * 1024;
-        let is_indexable =
-            |f: &FileItem| !f.is_binary() && f.size > 0 && f.size <= BIGRAM_ELIGIBLE_MAX_SIZE;
+        // non-zero size, not larger than `BIGRAM_CONTENT_CAP`. Capping indexable
+        // size at the bigram scan window means every indexed file is fully
+        // covered — no partial-content false negatives. Files above the cap
+        // land past `indexable_count` and are always scanned at grep time.
+        let is_indexable = |f: &FileItem| {
+            !f.is_binary()
+                && f.size > 0
+                && f.size <= crate::bigram_filter::BIGRAM_CONTENT_CAP as u64
+        };
         BACKGROUND_THREAD_POOL.install(|| {
             files.par_sort_unstable_by(|a, b| {
                 // Sort indexables first (true < false when we invert with !).
@@ -1996,6 +1922,33 @@ impl FileSync {
             bigram_overlay: None,
             chunked_paths: Some(Arc::new(chunked_paths)),
         })
+    }
+}
+
+/// Pre-populate mmap caches for cold tail files so the first grep search
+/// doesn't pay the mmap creation + page fault cost.
+#[tracing::instrument(skip(files), name = "warmup_mmaps", level = Level::DEBUG)]
+pub(crate) fn warmup_mmaps(
+    files: &[FileItem],
+    budget: &ContentCacheBudget,
+    base_path: &Path,
+    arena: ArenaPtr,
+) {
+    // for most of the use cases mmaps limit would be signficantly smaller than arepo
+    for file in files.iter() {
+        if file.is_likely_hot()
+            || file.is_binary()
+            || file.size == 0
+            || file.size > budget.max_file_size
+        {
+            continue;
+        }
+
+        let _ = file.get_cached_content(arena, base_path, budget);
+
+        if budget.is_exhausted() {
+            break;
+        }
     }
 }
 
