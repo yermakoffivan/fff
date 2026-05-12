@@ -250,9 +250,7 @@ function M.run(opts)
     end
 
     report_db_health(rust_health.frecency, health.rust.frecency, health.messages, 'Frecency database', {
-      populate = function(section, db_info)
-        section.entries = db_info.absolute_frecency_entries
-      end,
+      populate = function(section, db_info) section.entries = db_info.absolute_frecency_entries end,
       format_healthy_msg = function(db_info)
         return string.format(
           'Frecency database operational (%d entries, %s, path: %s)',

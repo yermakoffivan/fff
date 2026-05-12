@@ -50,6 +50,7 @@ if type(results) ~= 'table' then die('fuzzy_search_files did not return a table'
 ok(string.format('fuzzy_search_files returned %d results', #(results.items or results)))
 
 -- Give the GC thread up to ~2s to flip Pending -> Healthy
+---@type any
 local health = nil
 local deadline = vim.loop.now() + 2000
 while vim.loop.now() < deadline do

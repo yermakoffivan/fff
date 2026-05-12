@@ -26,7 +26,7 @@ pub enum Error {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
-    #[error("Something is wrong with the local db insance: {0}")]
+    #[error("Something is wrong with the local db instance: {0}")]
     GenericDbError(#[from] heed::Error),
     #[error("Failed to open {db} database env: {source}")]
     EnvOpen {

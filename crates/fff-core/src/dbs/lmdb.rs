@@ -1,3 +1,4 @@
+use heed::{Database, Env, EnvOpenOptions};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -5,7 +6,6 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
-use heed::{Database, Env, EnvOpenOptions};
 
 use crate::error::{Error, Result};
 
@@ -67,7 +67,7 @@ impl DbHealth {
 
 /// Spawns a background thread that is ensuring that the environment that was previously
 /// open is safe, accessible and doesn't have a corrupted lock.md file. If it does this thread will
-/// hang indefinetely but we will have the information that the database is in failure mode
+/// hang indefinitely but we will have the information that the database is in failure mode
 pub(crate) fn spawn_lmdb_gc<T: LmdbStore>(shared: Arc<RwLock<Option<T>>>) {
     let thread_shared = shared.clone();
     let spawn_result = thread::Builder::new()
