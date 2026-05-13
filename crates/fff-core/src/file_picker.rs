@@ -338,11 +338,6 @@ impl FileItem {
         Self::new_with_metadata(path, base_path, git_status, metadata.as_ref())
     }
 
-    pub fn delete(&mut self) {
-        self.set_deleted(true);
-        self.git_status = Some(Status::INDEX_DELETED); // this is not needed but cool
-    }
-
     /// Create a FileItem using pre-fetched metadata to avoid a redundant stat syscall.
     /// Returns `(FileItem, relative_path)`. The FileItem's `path` field is
     /// empty; callers must populate it via `set_path` or `build_chunked_path_store_and_assign`.
@@ -1418,16 +1413,22 @@ impl FilePicker {
     fn handle_file_modify(&mut self, path: &Path, slot: FileSlot) -> Option<&FileItem> {
         let overlay = self.sync_data.bigram_overlay.as_ref().map(Arc::clone);
         let pos = slot.index();
-        let file = self.sync_data.get_file_mut(pos)?;
 
-        let metadata = std::fs::metadata(path)
-            .inspect_err(|e| {
-                tracing::error!(
-                    ?e,
-                    "File market for modification doesn't exists or not accessible"
-                )
-            })
-            .ok()?;
+        // this is the only way to actaully know if the file is on disk, we CAN NOT
+        // rely on the watcher to proive the latest state of the file, do the actual check
+        let metadata = match std::fs::metadata(path) {
+            Ok(m) => {
+                self.untombstone_file(pos);
+
+                m
+            }
+            Err(_) => {
+                self.tombstone_file(pos);
+                return None;
+            }
+        };
+
+        let file = self.sync_data.get_file_mut(pos)?;
 
         let size = metadata.len();
         let modified_time = metadata
@@ -1435,11 +1436,6 @@ impl FilePicker {
             .ok()
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
-
-        let was_deleted = file.is_deleted();
-        if was_deleted {
-            file.set_deleted(false);
-        }
 
         file.update_metadata(&self.cache_budget, modified_time, Some(size));
 
@@ -1455,12 +1451,6 @@ impl FilePicker {
             if in_indexable && let Ok(content) = std::fs::read(path) {
                 overlay.write().modify_file(pos, &content);
             }
-        }
-
-        // Increment after dropping the mutable file reference so the
-        // reborrow for the return doesn't conflict.
-        if was_deleted {
-            self.sync_data.live_count += 1;
         }
 
         self.sync_data.files().get(pos)
@@ -1511,30 +1501,45 @@ impl FilePicker {
         self.sync_data.files.last()
     }
 
-    /// Tombstone a file instead of removing it, keeping base indices stable.
+    fn tombstone_file(&mut self, index: usize) {
+        let file = &mut self.sync_data.files[index];
+
+        file.set_deleted(true);
+        file.invalidate_mmap(&self.cache_budget);
+        file.git_status = None;
+
+        // Only base-region files participate in the bigram overlay
+        if index < self.sync_data.base_count {
+            if let Some(ref overlay) = self.sync_data.bigram_overlay {
+                overlay.write().delete_file(index);
+            }
+        }
+
+        self.sync_data.live_count -= 1;
+    }
+
+    fn untombstone_file(&mut self, index: usize) {
+        let file = &mut self.sync_data.files[index];
+        file.set_deleted(false);
+
+        self.sync_data.live_count += 1;
+    }
+
+    /// Marks file as deleted, make sure that if you call this yourself these changes can be reverted
+    /// by the internal mechanics if the file actully exists on the disk, use only if you know that
+    /// the file going to be disapperaed or if you do not have the watcher installed
     pub fn remove_file_by_path(&mut self, path: impl AsRef<Path>) -> bool {
         let path = path.as_ref();
         match self.sync_data.find_file_index(path, &self.base_path) {
             Ok(index) => {
-                let file = &mut self.sync_data.files[index];
-                file.set_deleted(true);
-                file.git_status = None;
-                file.invalidate_mmap(&self.cache_budget);
-                if let Some(ref overlay) = self.sync_data.bigram_overlay {
-                    overlay.write().delete_file(index);
-                }
-                self.sync_data.live_count -= 1;
+                self.tombstone_file(index);
                 true
             }
             Err(_) => {
                 let rel = self.to_relative_path(path);
                 let rel_ref: &str = rel.as_deref().unwrap_or("");
                 if let Some(abs_pos) = self.sync_data.find_overflow_index(rel_ref) {
-                    let file = &mut self.sync_data.files[abs_pos];
-                    file.set_deleted(true);
-                    file.git_status = None;
-                    file.invalidate_mmap(&self.cache_budget);
-                    self.sync_data.live_count -= 1;
+                    self.tombstone_file(abs_pos);
                     true
                 } else {
                     false
@@ -2001,7 +2006,8 @@ fn populates_dirs_files_chunked_storage<'a>(
 /// Fast extension-based binary detection. Avoids opening files during scan.
 /// Covers the vast majority of binary files in typical repositories.
 #[inline]
-fn is_known_binary_extension(path: &Path) -> bool {
+#[doc(hidden)]
+pub fn is_known_binary_extension(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
@@ -2010,7 +2016,7 @@ fn is_known_binary_extension(path: &Path) -> bool {
         ext,
         // Images
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "webp" | "tiff" | "tif" | "avif" |
-        "heic" | "psd" | "icns" | "cur" | "raw" | "cr2" | "nef" | "dng" |
+        "heic" | "psd" | "icns" | "cur" | "raw" | "cr2" | "nef" | "dng" | "tga" |
         // Video/Audio
         "mp4" | "avi" | "mov" | "wmv" | "mkv" | "mp3" | "wav" | "flac" | "ogg" | "m4a" |
         "aac" | "webm" | "flv" | "mpg" | "mpeg" | "wma" | "opus" | "pcm" | "reapeaks" |
@@ -2019,10 +2025,10 @@ fn is_known_binary_extension(path: &Path) -> bool {
         "cab" | "cpio" | "jsonlz4" |
         // Packages/Installers
         "deb" | "rpm" | "apk" | "dmg" | "msi" | "iso" | "nupkg" | "whl" | "egg" |
-        "snap" | "appimage" | "flatpak" | "crx" | "pak" |
+        "appimage" | "flatpak" | "crx" | "pak" |
         // Executables/Libraries
         "exe" | "dll" | "so" | "dylib" | "o" | "a" | "lib" | "bin" | "elf" |
-        // Documents
+        // Documents (binary office formats)
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" |
         // Databases
         "db" | "sqlite" | "sqlite3" | "mdb" |
@@ -2034,18 +2040,19 @@ fn is_known_binary_extension(path: &Path) -> bool {
         // Compiled/Runtime
         "class" | "pyc" | "pyo" | "wasm" | "dex" | "jar" | "war" |
         // OCaml / Swift / Objective-C build artefacts
-        "cmi" | "cmt" | "cmti" | "cmx" | "cof" | "cot" | "cop" | "nib" |
+        "cmi" | "cmt" | "cmti" | "cmx" | "cof" | "cop" | "nib" |
         "swiftdeps" | "swiftdeps~" | "swiftdoc" | "swiftmodule" | "swiftsourceinfo" |
         // ML/Data Science
         "npy" | "npz" | "pkl" | "pickle" | "h5" | "hdf5" | "pt" | "pth" | "onnx" |
         "safetensors" | "tfrecord" |
-        // 3D/Game
-        "glb" | "fbx" | "blend" | "blp" | "tga" |
-        // Game engines / Unity-Unreal side-files
-        "meta" | "dat" | "tfx" | "dia" | "journal" | "toc" | "thm" | "pfl" |
-        "shadow" | "scan" | "flm" | "bcmap" | "userinfo" |
+        // 3D/Game assets
+        "glb" | "fbx" | "blend" | "blp" |
+        // Compressed-text formats (gzip/binary on disk)
+        "dia" | "tfx" | "flm" | "bcmap" | "journal" |
+        // Protobuf wire format
+        "pb" |
         // Data/serialized
-        "parquet" | "arrow" | "pb" |
+        "parquet" | "arrow" |
         // IDE/OS metadata
         "DS_Store" | "suo"
     )

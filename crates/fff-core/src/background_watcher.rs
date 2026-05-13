@@ -579,6 +579,13 @@ fn handle_debounced_events(
 
         files_to_update_git_status.reserve(paths_to_add_or_modify.len());
         for path in &paths_to_add_or_modify {
+            // Double-check existence: the debouncer may deliver a Modify event
+            // for a path that was deleted between event emission and processing
+            // (Create+Remove merged into just Create by the debouncer).
+            if !path.exists() {
+                picker.remove_file_by_path(path);
+                continue;
+            }
             if picker.handle_create_or_modify(path).is_some() {
                 files_to_update_git_status.push(path.to_path_buf());
             } else {
@@ -587,6 +594,29 @@ fn handle_debounced_events(
         }
 
         overflow_count = picker.get_overflow_files().len();
+
+        // Reconcile overflow files: stat-check each live overflow file and
+        // tombstone any that no longer exist on disk. This handles deletions
+        // where the debouncer swallowed the Remove event.
+        if overflow_count > 0 {
+            let base_path = picker.base_path().to_path_buf();
+            let stale: Vec<PathBuf> = picker
+                .get_overflow_files()
+                .iter()
+                .filter(|f| !f.is_deleted())
+                .filter_map(|f| {
+                    let abs = f.absolute_path(&*picker, &base_path);
+                    (!abs.exists()).then_some(abs)
+                })
+                .collect();
+
+            for path in &stale {
+                picker.remove_file_by_path(path);
+            }
+            if !stale.is_empty() {
+                overflow_count = picker.get_overflow_files().len();
+            }
+        }
     }
 
     info!(
@@ -594,6 +624,10 @@ fn handle_debounced_events(
         overflow_count, "File index changes applied",
     );
 
+    // Reconcile overflow files unconditionally on every batch: stat-check
+    // each live overflow file and tombstone any that no longer exist on disk.
+    // This is the only reliable way to detect deletions when the debouncer
+    // coalesces Create+Remove for the same path into nothing.
     if need_full_rescan || overflow_count > MAX_OVERFLOW_FILES {
         info!("Watcher faced limit of index overflow. Triggering rescan");
         if let Err(e) = shared_picker.trigger_full_rescan_async(shared_frecency) {
@@ -645,46 +679,57 @@ fn handle_debounced_events(
         }
     }
 
-    // Git status updates require a repository.
-    let Some(repo) = repo.as_ref() else {
-        debug!("No git repo available, skipping git status updates");
-        return new_dirs_to_watch;
-    };
+    // Git status updates are IO-heavy (reads .git/index, stats files) and
+    // not on the critical path for search correctness. Spawn them on the
+    // background pool so the debouncer handler returns immediately and can
+    // process the next event batch without waiting for git.
+    if need_full_git_rescan || !files_to_update_git_status.is_empty() {
+        let sp = shared_picker.clone();
+        let sf = shared_frecency.clone();
+        let git_workdir = repo.as_ref().map(|r| {
+            r.workdir()
+                .unwrap_or_else(|| r.path())
+                .to_path_buf()
+        });
+        let full_rescan = need_full_git_rescan;
+        let need_picker_rescan = need_full_rescan;
+        let files = files_to_update_git_status;
 
-    if need_full_git_rescan && !need_full_rescan {
-        info!("Triggering full git rescan");
+        crate::file_picker::BACKGROUND_THREAD_POOL.spawn(move || {
+            let Some(git_path) = git_workdir else { return };
+            let Ok(repo) = Repository::open(&git_path) else {
+                error!("Failed to open git repo for async status update");
+                return;
+            };
 
-        if let Err(e) = shared_picker.refresh_git_status(shared_frecency) {
-            error!("Failed to refresh git status: {:?}", e);
-        }
-    }
-
-    // do not update the git status if the
-    if !files_to_update_git_status.is_empty() && !need_full_git_rescan {
-        info!(
-            "Fetching git status for {} files",
-            files_to_update_git_status.len()
-        );
-
-        let status = match GitStatusCache::git_status_for_paths(repo, &files_to_update_git_status) {
-            Ok(status) => status,
-            Err(e) => {
-                tracing::error!(?e, "Failed to query git status");
-                return new_dirs_to_watch;
+            if full_rescan && !need_picker_rescan {
+                info!("Async: triggering full git rescan");
+                if let Err(e) = sp.refresh_git_status(&sf) {
+                    error!("Failed to refresh git status: {:?}", e);
+                }
             }
-        };
 
-        if let Ok(mut guard) = shared_picker.write()
-            && let Some(ref mut picker) = *guard
-        {
-            if let Err(e) = picker.update_git_statuses(status, shared_frecency) {
-                error!("Failed to update git statuses: {:?}", e);
-            } else {
-                info!("Successfully updated git statuses in picker");
+            if !files.is_empty() && !full_rescan {
+                info!("Async: fetching git status for {} files", files.len());
+                let status = match GitStatusCache::git_status_for_paths(&repo, &files) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to query git status: {:?}", e);
+                        return;
+                    }
+                };
+
+                if let Ok(mut guard) = sp.write()
+                    && let Some(ref mut picker) = *guard
+                {
+                    if let Err(e) = picker.update_git_statuses(status, &sf) {
+                        error!("Failed to update git statuses: {:?}", e);
+                    } else {
+                        info!("Async: git statuses updated");
+                    }
+                }
             }
-        } else {
-            error!("Failed to acquire picker lock for git status update");
-        }
+        });
     }
 
     new_dirs_to_watch

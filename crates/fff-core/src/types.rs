@@ -510,6 +510,8 @@ impl FileItem {
     }
 
     #[inline]
+    #[doc(hidden)]
+    /// Don't use it, use FilePicker::delete_file
     pub fn set_deleted(&self, val: bool) {
         if val {
             self.flags

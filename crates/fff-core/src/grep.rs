@@ -2157,9 +2157,15 @@ pub(crate) fn grep_search<'a>(
                         return true;
                     }
 
-                    // we use ptr offsets to avoid additional allocations and keep the index
                     let file_idx =
                         unsafe { (*f as *const FileItem).offset_from(base_ptr) as usize };
+
+                    // Files past the bigram boundary (unindexable base files)
+                    // are not tracked by the bigram filter — always search them.
+                    if file_idx >= overflow_start {
+                        return true;
+                    }
+
                     BigramFilter::is_candidate(candidates, file_idx)
                 });
             }
