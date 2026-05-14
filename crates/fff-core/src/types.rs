@@ -1,5 +1,6 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "windows"))]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
@@ -211,7 +212,7 @@ pub struct FileItem {
     pub modification_frecency_score: i16,
     pub git_status: Option<git2::Status>,
     pub(crate) path: crate::simd_path::ChunkedString,
-    parent_dir: u32,
+    pub(crate) parent_dir_index: u32,
     flags: AtomicU8,
     #[cfg(not(target_os = "windows"))]
     content: OnceLock<memmap2::Mmap>,
@@ -221,7 +222,7 @@ impl Clone for FileItem {
     fn clone(&self) -> Self {
         Self {
             path: self.path.clone(),
-            parent_dir: self.parent_dir,
+            parent_dir_index: self.parent_dir_index,
             size: self.size,
             modified: self.modified,
             access_frecency_score: self.access_frecency_score,
@@ -253,7 +254,7 @@ impl FileItem {
 
         Self {
             path,
-            parent_dir: u32::MAX,
+            parent_dir_index: u32::MAX,
             size,
             modified,
             access_frecency_score: 0,
@@ -274,14 +275,6 @@ impl FileItem {
 
     pub(crate) fn set_path(&mut self, path: crate::simd_path::ChunkedString) {
         self.path = path;
-    }
-
-    pub(crate) fn parent_dir_index(&self) -> u32 {
-        self.parent_dir
-    }
-
-    pub(crate) fn set_parent_dir(&mut self, idx: u32) {
-        self.parent_dir = idx;
     }
 
     pub fn dir_str(&self, arena: impl FFFStringStorage) -> String {
@@ -901,32 +894,5 @@ impl ContentCacheBudget {
 impl Default for ContentCacheBudget {
     fn default() -> Self {
         Self::new_for_repo(30_000)
-    }
-}
-
-#[cfg(test)]
-impl FileItem {
-    pub(crate) fn new_for_test_with_arena(
-        rel_path: &str,
-        size: u64,
-        modified: u64,
-        git_status: Option<git2::Status>,
-        is_binary: bool,
-    ) -> (Self, ArenaPtr) {
-        let filename_start = rel_path
-            .rfind(std::path::is_separator)
-            .map(|i| i + 1)
-            .unwrap_or(0) as u16;
-        let mut item = Self::new_raw(filename_start, size, modified, git_status, is_binary);
-        let paths = [rel_path.to_string()];
-        let (store, strings) = crate::simd_path::build_chunked_path_store_from_strings(
-            &paths,
-            std::slice::from_ref(&item),
-        );
-        let cs = strings.into_iter().next().unwrap();
-        let arena = store.as_arena_ptr();
-        item.set_path(cs);
-        std::mem::forget(store);
-        (item, arena)
     }
 }

@@ -1655,8 +1655,11 @@ fn fuzzy_grep_search<'a>(
                     return None;
                 }
 
-
-                let file_arena = if file.is_overflow() { overflow_arena } else { arena };
+                let file_arena = if file.is_overflow() {
+                    overflow_arena
+                } else {
+                    arena
+                };
                 let file_bytes = file.get_content_for_search(buf, file_arena, base_path, budget)?;
 
                 // File-level prefilter: check if enough distinct needle chars

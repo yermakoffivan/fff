@@ -14,7 +14,10 @@ fn resolve_repo() -> Option<PathBuf> {
             return fff::path_utils::canonicalize(&p).ok();
         }
     }
-    let default = PathBuf::from("./big-repo");
+    // Resolve relative to the workspace root (two levels up from this crate).
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..");
+    let default = workspace_root.join("big-repo");
     if default.exists() {
         return fff::path_utils::canonicalize(&default).ok();
     }

@@ -596,13 +596,7 @@ impl BigramOverlay {
     }
 }
 
-/// Per-file size cap for bigram indexing. Doubles as the `is_indexable`
-/// cutoff in the finalize-sort: files over this size are pushed past
-/// `indexable_count` and unconditionally scanned at grep time instead of
-/// being bigram-prefiltered. Unifying the two caps guarantees that every
-/// file inside the indexed region gets *full* bigram coverage, so the
-/// prefilter never produces false negatives on partial-content files.
-pub(crate) const BIGRAM_CONTENT_CAP: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_INDEXABLE_FILE_SIZE: usize = 2 * 1024 * 1024;
 const BIGRAM_CHUNK_FILES: usize = 4 * 64;
 
 /// Sparse-column cutoff for the skip-1 sub-index. Rare skip columns add
@@ -611,16 +605,14 @@ const BIGRAM_CHUNK_FILES: usize = 4 * 64;
 const SKIP_INDEX_MIN_DENSITY_PCT: u32 = 12;
 
 thread_local! {
-    /// Per-rayon-worker reusable read buffer. Allocated via `vec!` to avoid
-    /// materializing the 2 MiB array on the worker stack (`Box::new([0u8; N])`
-    /// constructs the array in the current frame first, which overflows the
-    /// default 2 MiB rayon worker stack).
+    /// Reusable read buffer that is allocated per thread and used for reading files
     static READ_BUF: std::cell::RefCell<Box<[u8]>> =
-        std::cell::RefCell::new(vec![0u8; BIGRAM_CONTENT_CAP].into_boxed_slice());
+        std::cell::RefCell::new(vec![0u8; MAX_INDEXABLE_FILE_SIZE].into_boxed_slice());
 }
 
 /// reads a chunk for bigram either from new warmed up cache or from the file directly
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn read_bigram_chunk<'a>(
     file: &'a crate::types::FileItem,
     base_fd: libc::c_int,
@@ -640,10 +632,10 @@ fn read_bigram_chunk<'a>(
             return None;
         }
 
-        return Some(&cached[..cached.len().min(BIGRAM_CONTENT_CAP)]);
+        return Some(&cached[..cached.len().min(MAX_INDEXABLE_FILE_SIZE)]);
     }
 
-    let want = (file.size as usize).min(BIGRAM_CONTENT_CAP);
+    let want = (file.size as usize).min(MAX_INDEXABLE_FILE_SIZE);
     let filled = file.read_trimmed_into_buf(base_fd, base_path, arena, path_buf, &mut buf[..want]);
     if filled == 0 {
         return None;
@@ -724,7 +716,7 @@ pub(crate) fn build_bigram_index(
 
     // in progress bigram walk + rust's ignore crate allocates shit ton of garbage memory
     // all custom allocators would think this is available resource while we do not allocate
-    // afte the sync, so it's very important to let the unused memory go back to the OS
+    // after the sync, so it's very important to let the unused memory go back to the OS
     crate::file_picker::hint_allocator_collect();
 
     index

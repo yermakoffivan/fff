@@ -217,10 +217,11 @@ impl FileSync {
         self.files.get_mut(index)
     }
 
-    /// Find file index by path using binary search on the sorted base portion.
+    /// Find file index by path using binary search on the sorted base partitions,
+    /// falling back to a linear scan of the overflow region.
     /// `path` must be an absolute path under `base_path`.
     #[inline]
-    fn find_file_index(&self, path: &Path, base_path: &Path) -> Result<usize, usize> {
+    fn find_file_index(&self, path: &Path, base_path: &Path) -> Option<usize> {
         let arena = self.arena_base_ptr();
 
         // Strip base_path prefix to get the relative path. On Windows this
@@ -232,11 +233,11 @@ impl FileSync {
             Err(_) => {
                 #[cfg(windows)]
                 {
-                    canonical_relative_path(path, base_path).ok_or(0usize)?
+                    canonical_relative_path(path, base_path)?
                 }
                 #[cfg(not(windows))]
                 {
-                    return Err(0);
+                    return None;
                 }
             }
         };
@@ -253,49 +254,49 @@ impl FileSync {
         // Binary search dirs to find the parent directory index.
         // Dir items store the relative path including trailing '/' (e.g. "src/components/").
         let mut dir_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-        let dir_idx = match self
+        let dir_idx = self
             .dirs
             .binary_search_by(|d| d.read_relative_path(arena, &mut dir_buf).cmp(dir_rel))
-        {
-            Ok(idx) => idx as u32,
-            Err(_) => return Err(0), // directory not found
-        };
+            .ok();
 
-        // Binary search files by (parent_dir, filename). Base files live in
-        // two internally-sorted partitions — indexable first, then
-        // unindexable — so we try each half in turn. Two O(log n) searches
-        // with short-circuit on the first hit.
-        let cmp_key = |f: &FileItem| {
-            f.parent_dir_index().cmp(&dir_idx).then_with(|| {
-                let fname = f.file_name(arena);
-                fname.as_str().cmp(filename)
-            })
-        };
+        // Binary search base files by (parent_dir, filename). Base files live in
+        // two internally-sorted partitions — indexable first, then unindexable —
+        // so we try each half in turn. Two O(log n) searches with short-circuit.
+        if let Some(dir_idx) = dir_idx {
+            let dir_idx = dir_idx as u32;
+            let cmp_key = |f: &FileItem| {
+                f.parent_dir_index.cmp(&dir_idx).then_with(|| {
+                    let fname = f.file_name(arena);
+                    fname.as_str().cmp(filename)
+                })
+            };
 
-        if self.indexable_count > 0
-            && let Ok(pos) = self.files[..self.indexable_count].binary_search_by(cmp_key)
-        {
-            return Ok(pos);
+            if self.indexable_count > 0
+                && let Ok(pos) = self.files[..self.indexable_count].binary_search_by(cmp_key)
+            {
+                return Some(pos);
+            }
+
+            if self.indexable_count < self.base_count
+                && let Ok(rel_pos) =
+                    self.files[self.indexable_count..self.base_count].binary_search_by(cmp_key)
+            {
+                return Some(self.indexable_count + rel_pos);
+            }
         }
 
-        if self.indexable_count < self.base_count
-            && let Ok(rel_pos) =
-                self.files[self.indexable_count..self.base_count].binary_search_by(cmp_key)
-        {
-            return Ok(self.indexable_count + rel_pos);
+        // Overflow region: linear scan by full relative path.
+        if self.base_count < self.files.len() {
+            let overflow_arena = self.overflow_arena_ptr();
+            if let Some(pos) = self.files[self.base_count..]
+                .iter()
+                .position(|f| f.relative_path_eq(overflow_arena, rel_path))
+            {
+                return Some(self.base_count + pos);
+            }
         }
 
-        Err(0)
-    }
-
-    /// Find a file in the overflow portion by relative path (linear scan).
-    /// Returns the absolute index into `files` (i.e. `base_count + position`).
-    fn find_overflow_index(&self, relative_path: &str) -> Option<usize> {
-        let overflow_arena = self.overflow_arena_ptr();
-        self.files[self.base_count..]
-            .iter()
-            .position(|f| f.relative_path_eq(overflow_arena, relative_path))
-            .map(|pos| self.base_count + pos)
+        None
     }
 
     /// Tombstone every file that matches `predicate`. No shift: the
@@ -1313,6 +1314,7 @@ impl FilePicker {
         let bp = self.base_path.clone();
         let arena = self.arena_base_ptr();
         let frecency = shared_frecency.read()?;
+
         status_cache
             .into_iter()
             .try_for_each(|(path, status)| -> Result<(), Error> {
@@ -1325,7 +1327,7 @@ impl FilePicker {
                     // interior-mutable atomic score, so `&self` access is
                     // enough — no write aliasing against Arc clones.
                     let score = file.access_frecency_score as i32;
-                    let dir_idx = file.parent_dir_index() as usize;
+                    let dir_idx = file.parent_dir_index as usize;
                     if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
                         dir.update_frecency_if_larger(score);
                     }
@@ -1348,13 +1350,9 @@ impl FilePicker {
     ) -> Result<(), Error> {
         let path = file_path.as_ref();
         let arena = self.arena_base_ptr();
-        let rel = self.to_relative_path(path);
-        let rel_ref: &str = rel.as_deref().unwrap_or("");
-        let index = self
-            .sync_data
-            .find_file_index(path, &self.base_path)
-            .ok()
-            .or_else(|| self.sync_data.find_overflow_index(rel_ref));
+
+        let index = self.sync_data.find_file_index(path, &self.base_path);
+
         if let Some(index) = index
             && let Some(file) = self.sync_data.get_file_mut(index)
         {
@@ -1362,7 +1360,7 @@ impl FilePicker {
 
             // Update parent dir frecency inline (atomic, &self access).
             let score = file.access_frecency_score as i32;
-            let dir_idx = file.parent_dir_index() as usize;
+            let dir_idx = file.parent_dir_index as usize;
             if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
                 dir.update_frecency_if_larger(score);
             }
@@ -1374,19 +1372,12 @@ impl FilePicker {
     pub fn get_file_by_path(&self, path: impl AsRef<Path>) -> Option<&FileItem> {
         self.sync_data
             .find_file_index(path.as_ref(), &self.base_path)
-            .ok()
             .and_then(|index| self.sync_data.files().get(index))
     }
 
     pub fn get_mut_file_by_path(&mut self, path: impl AsRef<Path>) -> Option<&mut FileItem> {
         let path = path.as_ref();
-        let rel = self.to_relative_path(path);
-        let rel_ref: &str = rel.as_deref().unwrap_or("");
-        let index = self
-            .sync_data
-            .find_file_index(path, &self.base_path)
-            .ok()
-            .or_else(|| self.sync_data.find_overflow_index(rel_ref));
+        let index = self.sync_data.find_file_index(path, &self.base_path);
         index.and_then(|i| self.sync_data.get_file_mut(i))
     }
 
@@ -1397,13 +1388,14 @@ impl FilePicker {
     pub fn handle_create_or_modify(&mut self, path: impl AsRef<Path> + Debug) -> Option<&FileItem> {
         let path = path.as_ref();
 
-        if let Ok(idx) = self.sync_data.find_file_index(path, &self.base_path) {
-            return self.handle_file_modify(path, FileSlot::Base(idx));
-        }
+        if let Some(idx) = self.sync_data.find_file_index(path, &self.base_path) {
+            let slot = if idx < self.sync_data.base_count {
+                FileSlot::Base(idx)
+            } else {
+                FileSlot::Overflow(idx)
+            };
 
-        let relative_path = self.to_relative_path(path)?;
-        if let Some(idx) = self.sync_data.find_overflow_index(&relative_path) {
-            return self.handle_file_modify(path, FileSlot::Overflow(idx));
+            return self.handle_file_modify(path, slot);
         }
 
         self.add_new_file(path)
@@ -1414,7 +1406,7 @@ impl FilePicker {
         let overlay = self.sync_data.bigram_overlay.as_ref().map(Arc::clone);
         let pos = slot.index();
 
-        // this is the only way to actaully know if the file is on disk, we CAN NOT
+        // this is the only way to actually know if the file is on disk, we CAN NOT
         // rely on the watcher to proive the latest state of the file, do the actual check
         let metadata = match std::fs::metadata(path) {
             Ok(m) => {
@@ -1503,16 +1495,19 @@ impl FilePicker {
 
     fn tombstone_file(&mut self, index: usize) {
         let file = &mut self.sync_data.files[index];
+        if file.is_deleted() {
+            return;
+        }
 
         file.set_deleted(true);
         file.invalidate_mmap(&self.cache_budget);
         file.git_status = None;
 
         // Only base-region files participate in the bigram overlay
-        if index < self.sync_data.base_count {
-            if let Some(ref overlay) = self.sync_data.bigram_overlay {
-                overlay.write().delete_file(index);
-            }
+        if index < self.sync_data.base_count
+            && let Some(ref overlay) = self.sync_data.bigram_overlay
+        {
+            overlay.write().delete_file(index);
         }
 
         self.sync_data.live_count -= 1;
@@ -1520,31 +1515,24 @@ impl FilePicker {
 
     fn untombstone_file(&mut self, index: usize) {
         let file = &mut self.sync_data.files[index];
+        if !file.is_deleted() {
+            return;
+        }
         file.set_deleted(false);
 
         self.sync_data.live_count += 1;
     }
 
     /// Marks file as deleted, make sure that if you call this yourself these changes can be reverted
-    /// by the internal mechanics if the file actully exists on the disk, use only if you know that
+    /// by the internal mechanics if the file actually exists on the disk, use only if you know that
     /// the file going to be disapperaed or if you do not have the watcher installed
     pub fn remove_file_by_path(&mut self, path: impl AsRef<Path>) -> bool {
         let path = path.as_ref();
-        match self.sync_data.find_file_index(path, &self.base_path) {
-            Ok(index) => {
-                self.tombstone_file(index);
-                true
-            }
-            Err(_) => {
-                let rel = self.to_relative_path(path);
-                let rel_ref: &str = rel.as_deref().unwrap_or("");
-                if let Some(abs_pos) = self.sync_data.find_overflow_index(rel_ref) {
-                    self.tombstone_file(abs_pos);
-                    true
-                } else {
-                    false
-                }
-            }
+        if let Some(index) = self.sync_data.find_file_index(path, &self.base_path) {
+            self.tombstone_file(index);
+            true
+        } else {
+            false
         }
     }
 
@@ -1852,7 +1840,7 @@ impl FileSync {
                     let _ = file.update_frecency_scores(frecency, arena, base_path, mode);
                     let score = file.access_frecency_score as i32;
                     if score > 0 {
-                        let dir_idx = file.parent_dir_index() as usize;
+                        let dir_idx = file.parent_dir_index as usize;
                         if let Some(dir) = dirs_ref.get(dir_idx) {
                             dir.update_frecency_if_larger(score);
                         }
@@ -1862,28 +1850,19 @@ impl FileSync {
         }
         drop(frecency);
 
-        // Re-sort by (indexable-first, parent_dir, filename). Indexable base
-        // files come first so the bigram builder can size its column bitsets to
-        // just the indexable subset. Within each partition files stay sorted by
-        // (parent_dir, filename) — `find_file_index` does two binary searches
-        // (one per partition) to preserve O(log n) lookups.
-        //
-        // "Indexable" = can possibly contribute bigrams: not binary-by-extension,
-        // non-zero size, not larger than `BIGRAM_CONTENT_CAP`. Capping indexable
-        // size at the bigram scan window means every indexed file is fully
-        // covered — no partial-content false negatives. Files above the cap
-        // land past `indexable_count` and are always scanned at grep time.
+        // un-indexable files that are binary or not fitting the size cap has to beplaced in the end
         let is_indexable = |f: &FileItem| {
             !f.is_binary()
                 && f.size > 0
-                && f.size <= crate::bigram_filter::BIGRAM_CONTENT_CAP as u64
+                && f.size <= crate::bigram_filter::MAX_INDEXABLE_FILE_SIZE as u64
         };
+
         BACKGROUND_THREAD_POOL.install(|| {
             files.par_sort_unstable_by(|a, b| {
-                // Sort indexables first (true < false when we invert with !).
                 (!is_indexable(a))
                     .cmp(&!is_indexable(b))
-                    .then_with(|| a.parent_dir_index().cmp(&b.parent_dir_index()))
+                    // this just makes it faster in terms of allocation - we store the dir indexes
+                    .then_with(|| a.parent_dir_index.cmp(&b.parent_dir_index))
                     .then_with(|| a.file_name(arena).cmp(&b.file_name(arena)))
             });
         });
@@ -1939,7 +1918,7 @@ pub(crate) fn warmup_mmaps(
     base_path: &Path,
     arena: ArenaPtr,
 ) {
-    // for most of the use cases mmaps limit would be signficantly smaller than arepo
+    // for most of the use cases mmaps limit would be significantly smaller than arepo
     for file in files.iter() {
         if file.is_likely_hot()
             || file.is_binary()
@@ -1961,7 +1940,7 @@ pub(crate) fn warmup_mmaps(
 /// in one go: populates files chunked storage and creates new directories
 fn populates_dirs_files_chunked_storage<'a>(
     pairs: &'a mut [(FileItem, String)],
-    builder: &mut crate::simd_path::ChunkedPathStoreBuilder,
+    chunk_storage: &mut crate::simd_path::ChunkedPathStoreBuilder,
 ) -> Vec<DirItem> {
     let mut dirs: Vec<DirItem> = Vec::new();
 
@@ -1974,7 +1953,7 @@ fn populates_dirs_files_chunked_storage<'a>(
         let dir_part: &'a str = &rel[..file.path.filename_offset as usize];
 
         if !prev_dir_valid || prev_dir != dir_part {
-            let dir_string = builder.add_dir_immediate(dir_part);
+            let dir_string = chunk_storage.add_dir_immediate(dir_part);
 
             // Compute last-segment offset: for "src/components/" -> 4 (points to "components/")
             let last_seg = if dir_part.is_empty() {
@@ -1994,10 +1973,8 @@ fn populates_dirs_files_chunked_storage<'a>(
             prev_dir_valid = true;
         }
 
-        let cs = builder.add_file_immediate(rel, file.path.filename_offset);
-
-        file.set_path(cs);
-        file.set_parent_dir(current_dir_idx);
+        file.path = chunk_storage.add_file_immediate(rel, file.path.filename_offset);
+        file.parent_dir_index = current_dir_idx;
     }
 
     dirs

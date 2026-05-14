@@ -5,7 +5,6 @@ use std::{
     fmt::Debug,
     path::{Path, PathBuf},
 };
-use tracing::debug;
 
 pub(crate) fn default_status_options() -> StatusOptions {
     let mut opts = StatusOptions::new();
@@ -79,7 +78,7 @@ impl GitStatusCache {
         }
     }
 
-    #[tracing::instrument(skip(repo), level = tracing::Level::DEBUG)]
+    #[tracing::instrument(skip(repo), fields(paths_count = paths.len()), level = tracing::Level::DEBUG)]
     pub fn git_status_for_paths<TPath: AsRef<Path> + Debug>(
         repo: &Repository,
         paths: &[TPath],
@@ -111,11 +110,6 @@ impl GitStatusCache {
         }
 
         let git_status_cache = Self::read_status_impl(repo, &mut status_options)?;
-        debug!(
-            status_len = git_status_cache.statuses_len(),
-            "Multiple files git status"
-        );
-
         Ok(git_status_cache)
     }
 }

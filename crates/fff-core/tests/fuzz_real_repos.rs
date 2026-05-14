@@ -1,7 +1,7 @@
 //! Proptest-driven fuzz test against real GitHub repos with a live watcher.
 //!
 //! Clones real repository, runs the simulated close to real user sereies of file system ewvents and
-//! verifies that fff can still find the correct files. Test cases are randomzied and preserved
+//! verifies that fff can still find the correct files. Test cases are randomized and preserved
 //! using proptest
 //!
 //! Run:
@@ -104,7 +104,11 @@ fn copy_repo_to_workdir(cached: &Path, workdir: &Path) {
         .arg(workdir)
         .output()
         .expect("cp -r failed");
-    assert!(out.status.success(), "cp -r failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "cp -r failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn collect_text_files(base: &Path) -> Vec<PathBuf> {
@@ -156,7 +160,9 @@ fn collect_text_files(base: &Path) -> Vec<PathBuf> {
         if path.is_empty() {
             continue;
         }
-        let Ok(s) = std::str::from_utf8(path) else { continue };
+        let Ok(s) = std::str::from_utf8(path) else {
+            continue;
+        };
         if ignored_set.contains(s) {
             continue;
         }
@@ -199,7 +205,9 @@ fn inject_marker(path: &Path, marker: &str, seed: u32) -> Option<String> {
 /// Revert a file by restoring the original line at the same position
 /// where inject_marker placed the marker.
 fn revert_marker(path: &Path, marker: &str, original_line: &str) {
-    let Ok(content) = fs::read_to_string(path) else { return };
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
     let marker_line = format!("// {marker}");
     let result: String = content
         .lines()
@@ -293,9 +301,8 @@ fn run_scenario(ops: &[Op]) {
     // Stream fff logs at info+ level by default. Override with RUST_LOG.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("warn,fff_search=info")
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,fff_search=info")),
         )
         .with_test_writer()
         .try_init();
@@ -389,7 +396,13 @@ fn run_scenario(ops: &[Op]) {
                 let content = fs::read_to_string(&path).unwrap_or_default();
                 let new_content = content
                     .lines()
-                    .map(|l| if l == old_marker_line { format!("// {new_marker}") } else { l.to_string() })
+                    .map(|l| {
+                        if l == old_marker_line {
+                            format!("// {new_marker}")
+                        } else {
+                            l.to_string()
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
                     + "\n";
@@ -426,7 +439,13 @@ fn run_scenario(ops: &[Op]) {
                     let content = fs::read_to_string(target).unwrap_or_default();
                     let new_content = content
                         .lines()
-                        .map(|l| if l == old_marker_line { format!("// {marker}") } else { l.to_string() })
+                        .map(|l| {
+                            if l == old_marker_line {
+                                format!("// {marker}")
+                            } else {
+                                l.to_string()
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .join("\n")
                         + "\n";
@@ -436,8 +455,7 @@ fn run_scenario(ops: &[Op]) {
                     tracked[pos].last_write_sec = epoch_secs();
                 } else {
                     // First edit: inject marker at a deterministic line
-                    let original = inject_marker(target, &marker, *seed)
-                        .unwrap_or_default();
+                    let original = inject_marker(target, &marker, *seed).unwrap_or_default();
                     tracked.push(TrackedFile {
                         relative,
                         marker,
@@ -540,7 +558,9 @@ fn run_scenario(ops: &[Op]) {
                             last_failure = Some(format!(
                                 "{mode_name} grep for {:?} in {:?} not found\n\
                                  is_created={} exists={} on_disk_has_marker={}",
-                                tf.marker, tf.relative, tf.is_created,
+                                tf.marker,
+                                tf.relative,
+                                tf.is_created,
                                 workdir.join(&tf.relative).exists(),
                                 fs::read_to_string(workdir.join(&tf.relative))
                                     .map(|c| c.contains(&tf.marker))
@@ -561,9 +581,7 @@ fn run_scenario(ops: &[Op]) {
                             let found = grep_finds(picker, dead, GrepMode::PlainText);
                             drop(guard);
                             if found {
-                                last_failure = Some(format!(
-                                    "dead marker {dead:?} still findable"
-                                ));
+                                last_failure = Some(format!("dead marker {dead:?} still findable"));
                                 all_ok = false;
                                 break;
                             }
@@ -578,9 +596,8 @@ fn run_scenario(ops: &[Op]) {
                             let files = grep_file_list(picker, ig, GrepMode::PlainText);
                             drop(guard);
                             if !files.is_empty() {
-                                last_failure = Some(format!(
-                                    "ignored marker {ig:?} found in {files:?}"
-                                ));
+                                last_failure =
+                                    Some(format!("ignored marker {ig:?} found in {files:?}"));
                                 all_ok = false;
                                 break;
                             }
@@ -590,7 +607,9 @@ fn run_scenario(ops: &[Op]) {
                     if all_ok {
                         eprintln!(
                             "  op[{op_idx}] verify OK: {mode_name} mode, {} live, {} dead, {} ignored",
-                            tracked.len(), dead_markers.len(), ignored_markers.len(),
+                            tracked.len(),
+                            dead_markers.len(),
+                            ignored_markers.len(),
                         );
                         break;
                     }
@@ -616,8 +635,12 @@ fn run_scenario(ops: &[Op]) {
         let guard = shared_picker.read().unwrap();
         let picker = guard.as_ref().unwrap();
 
-        let live_ok = tracked.iter().all(|tf| grep_finds(picker, &tf.marker, GrepMode::PlainText));
-        let dead_ok = dead_markers.iter().all(|d| !grep_finds(picker, d, GrepMode::PlainText));
+        let live_ok = tracked
+            .iter()
+            .all(|tf| grep_finds(picker, &tf.marker, GrepMode::PlainText));
+        let dead_ok = dead_markers
+            .iter()
+            .all(|d| !grep_finds(picker, d, GrepMode::PlainText));
         drop(guard);
 
         if live_ok && dead_ok {

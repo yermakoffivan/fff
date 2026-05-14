@@ -315,7 +315,7 @@ impl ScanJob {
         let budget: &ContentCacheBudget = &unsafe_snapshot.budget;
         let files: &[crate::types::FileItem] = &unsafe_snapshot.files[..unsafe_snapshot.base_count];
 
-        // unified bigram and warmup_mmaps in one go, it's important to reuse open files as much as possible 
+        // unified bigram and warmup_mmaps in one go, it's important to reuse open files as much as possible
         if config.content_indexing && !signals.cancelled.load(Ordering::Acquire) {
             let indexable_files = &files[..unsafe_snapshot.indexable_count.min(files.len())];
             let index = build_bigram_index(
@@ -438,7 +438,7 @@ fn apply_git_status_and_frecency(
 
             let score = file.access_frecency_score as i32;
             if score > 0 {
-                let dir_idx = file.parent_dir_index() as usize;
+                let dir_idx = file.parent_dir_index as usize;
                 if let Some(dir) = dirs.get(dir_idx) {
                     dir.update_frecency_if_larger(score);
                 }
