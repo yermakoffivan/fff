@@ -3,9 +3,29 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use fff::file_picker::{FFFMode, FilePicker};
 use fff::{FilePickerOptions, SharedFilePicker, SharedFrecency};
 use std::path::PathBuf;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+
+static TRACING_INIT: Once = Once::new();
+
+fn init_tracing() {
+    TRACING_INIT.call_once(|| {
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new("warn,fff_search=info")),
+            )
+            .with_span_events(FmtSpan::CLOSE)
+            .with_target(true)
+            .with_writer(std::io::stderr)
+            .try_init();
+    });
+}
 
 fn resolve_repo() -> Option<PathBuf> {
     if let Ok(env_path) = std::env::var("FFF_BENCH_REPO") {
@@ -15,8 +35,7 @@ fn resolve_repo() -> Option<PathBuf> {
         }
     }
     // Resolve relative to the workspace root (two levels up from this crate).
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..");
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let default = workspace_root.join("big-repo");
     if default.exists() {
         return fff::path_utils::canonicalize(&default).ok();
@@ -107,6 +126,7 @@ fn cleanup(sp: SharedFilePicker) {
 }
 
 fn bench_full_init(c: &mut Criterion) {
+    init_tracing();
     let Some(repo) = resolve_repo() else {
         eprintln!("skip: set FFF_BENCH_REPO or clone a repo to ./big-repo");
         return;
@@ -136,6 +156,7 @@ fn bench_full_init(c: &mut Criterion) {
 }
 
 fn bench_post_scan_only(c: &mut Criterion) {
+    init_tracing();
     let Some(repo) = resolve_repo() else {
         return;
     };
@@ -164,6 +185,7 @@ fn bench_post_scan_only(c: &mut Criterion) {
 }
 
 fn bench_walk_only(c: &mut Criterion) {
+    init_tracing();
     let Some(repo) = resolve_repo() else {
         return;
     };

@@ -1194,33 +1194,6 @@ impl FilePicker {
         )
     }
 
-    #[doc(hidden)]
-    pub fn grep_original(
-        &self,
-        query: &FFFQuery<'_>,
-        options: &GrepSearchOptions,
-    ) -> GrepResult<'_> {
-        let arena = self.arena_base_ptr();
-        let overflow_arena = self.sync_data.overflow_arena_ptr();
-        let cancel = options
-            .abort_signal
-            .as_deref()
-            .unwrap_or(&self.signals.cancelled);
-
-        grep_search(
-            self.get_files(),
-            query,
-            options,
-            self.cache_budget(),
-            self.sync_data.bigram_index.as_deref(),
-            None,
-            cancel,
-            &self.base_path,
-            arena,
-            overflow_arena,
-        )
-    }
-
     // Returns an ongoing or finisshed scan progress
     pub fn get_scan_progress(&self) -> ScanProgress {
         let scanned_count = self.scanned_files_count.load(Ordering::Relaxed);
@@ -1233,9 +1206,12 @@ impl FilePicker {
         }
     }
 
-    pub(crate) fn set_bigram_index(&mut self, index: BigramFilter, overlay: BigramOverlay) {
+    pub(crate) fn set_bigram_index(&mut self, index: BigramFilter) {
         self.sync_data.bigram_index = Some(Arc::new(index));
-        self.sync_data.bigram_overlay = Some(Arc::new(parking_lot::RwLock::new(overlay)));
+        // once the index is reset automatically reset the overaly
+        self.sync_data.bigram_overlay = Some(Arc::new(parking_lot::RwLock::new(
+            BigramOverlay::new(self.sync_data.indexable_count),
+        )));
     }
 
     pub(crate) fn scan_signals(&self) -> crate::scan::ScanSignals {
@@ -1720,7 +1696,7 @@ impl FileSync {
         std::thread::spawn(move || {
             GitStatusCache::read_git_status(
                 Some(git_workdir.as_path()),
-                &mut crate::git::default_status_options(),
+                &mut crate::git::initial_scan_status_options(),
             )
         })
     }
@@ -1728,6 +1704,7 @@ impl FileSync {
     /// Returns files immediately (searchable) and a handle to the in-progress
     /// git status computation. This avoids blocking on `git status` which can
     /// take 10+ seconds on very large repos (e.g. chromium).
+    #[tracing::instrument(skip_all, name = "walk_filesystem", level = Level::INFO)]
     pub(crate) fn walk_filesystem(
         base_path: &Path,
         git_workdir: Option<PathBuf>,
@@ -1767,6 +1744,7 @@ impl FileSync {
         // no chunking, no HashMap, just Vec::push under the Mutex.
         let pairs = parking_lot::Mutex::new(Vec::<(FileItem, String)>::new());
 
+        let walker_span = tracing::info_span!("walker_run").entered();
         walker.run(|| {
             let pairs = &pairs;
             let counter = Arc::clone(synced_files_count);
@@ -1800,6 +1778,7 @@ impl FileSync {
                 ignore::WalkState::Continue
             })
         });
+        drop(walker_span);
 
         let mut pairs = pairs.into_inner();
         info!(

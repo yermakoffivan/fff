@@ -2284,6 +2284,11 @@ fn strip_file_path_constraints<'a>(
 mod tests {
     use super::*;
 
+    use crate::bigram_filter::BigramIndexBuilder;
+    use crate::file_picker::{FilePicker, FilePickerOptions};
+    use std::io::Write;
+    use std::sync::atomic::AtomicBool;
+
     #[test]
     fn test_unescaped_newline_detection() {
         // Single \n → multiline
@@ -2522,11 +2527,6 @@ mod tests {
     /// unconditionally appended by the overflow loop, producing duplicates.
     #[test]
     fn test_grep_no_duplicates_with_overflow_trailing_bits() {
-        use crate::bigram_filter::{BigramIndexBuilder, BigramOverlay};
-        use crate::file_picker::{FilePicker, FilePickerOptions};
-        use std::io::Write;
-        use std::sync::atomic::AtomicBool;
-
         let dir = tempfile::tempdir().unwrap();
         // Match the picker's internal dunce-canonicalize so paths passed to
         // on_create_or_modify resolve back to the same base_path on Windows.
@@ -2566,7 +2566,7 @@ mod tests {
         }
         let mut index = consec_builder.compress(Some(0));
         index.set_skip_index(skip_builder.compress(Some(0)));
-        picker.set_bigram_index(index, BigramOverlay::new(base_count));
+        picker.set_bigram_index(index);
 
         // Add three overflow files (new after the bigram index was built),
         // all containing "unicorn".

@@ -15,6 +15,20 @@ pub(crate) fn default_status_options() -> StatusOptions {
     opts
 }
 
+/// Status options for the initial scan / rescan.
+///
+/// Skips `include_unmodified` because every `FileItem` starts with
+/// `git_status: None` (== clean), so a missing cache entry already means
+/// "clean" — no need to ask libgit2 to enumerate every tracked path.
+/// Saves seconds on huge dirty trees (e.g. chromium with 400k+ entries).
+pub(crate) fn initial_scan_status_options() -> StatusOptions {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .exclude_submodules(true);
+    opts
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GitStatusCache(AHashMap<PathBuf, Status>);
 
