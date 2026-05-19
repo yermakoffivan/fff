@@ -97,12 +97,16 @@ local function generate_item_lines(ctx)
   local renderer = ctx.renderer
   if not renderer then renderer = require('fff.file_renderer') end
 
-  -- separator is displayed at the position of certain item, either before or after the item
-  -- rendered as an empty line at the level of rendered lines
-  local separator_after_anchor_in_iter = ctx.prompt_position ~= 'bottom'
+  -- Insert a gap on the side of the anchor away from the prompt.
+  -- Bottom prompt: gap BEFORE anchor in iter — anchor renders last with
+  -- reverse iter, so gap lands just above anchor visually.
+  -- Top prompt: gap AFTER anchor in iter — anchor renders first with
+  -- forward iter, so gap lands just below anchor visually.
+  -- Either way: anchor stays adjacent to the prompt, separator on far side.
+  local gap_before_anchor = ctx.prompt_position == 'bottom'
 
   for i = ctx.iter_start, ctx.iter_end, ctx.iter_step do
-    if ctx.separator and ctx.separator.idx == i and not separator_after_anchor_in_iter then
+    if ctx.separator and ctx.separator.idx == i and gap_before_anchor then
       table.insert(lines, '')
       separator_line = #lines
     end
@@ -110,12 +114,10 @@ local function generate_item_lines(ctx)
     local item = ctx.items[i]
     local item_start_line = #lines + 1
 
-    -- Renderer returns 1+ lines: virtual headers first, content line last.
     local item_lines = renderer.render_line(item, ctx, i)
     vim.list_extend(lines, item_lines)
 
-    local line_nr = #lines
-    local item_end_line = line_nr
+    local item_end_line = #lines
     local virtual_count = item_end_line - item_start_line
 
     item_to_lines[i] = {
@@ -124,7 +126,7 @@ local function generate_item_lines(ctx)
       virtual_count = virtual_count,
     }
 
-    if ctx.separator and ctx.separator.idx == i and separator_after_anchor_in_iter then
+    if ctx.separator and ctx.separator.idx == i and not gap_before_anchor then
       table.insert(lines, '')
       separator_line = #lines
     end
@@ -238,6 +240,7 @@ end
 --- @param list_win number List window handle
 --- @param ns_id number Highlight namespace
 --- @return number|nil separator_line 1-based buffer line of the separator (post-padding), nil if none
+--- @return table<number, ItemLineMapping> item_to_lines
 function M.render(ctx, list_buf, list_win, ns_id)
   local lines, item_to_lines, separator_line = generate_item_lines(ctx)
 
@@ -265,7 +268,7 @@ function M.render(ctx, list_buf, list_win, ns_id)
     end
   end
 
-  return separator_line
+  return separator_line, item_to_lines
 end
 
 --- Get the buffer line for an item's content (selectable) line.

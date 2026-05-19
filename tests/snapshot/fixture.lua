@@ -6,16 +6,41 @@
 
 local M = {}
 
---- Files used by every snapshot test. Kept tiny and stable on purpose.
+--- Files used by every snapshot test. Sized to overflow the list page so
+--- snapshots reflect realistic scrolling/clipping behaviour.
 local FIXTURE_FILES = {
   ['README.md'] = '# Fixture\n',
   ['src/main.rs'] = 'fn main() {}\n',
+  ['src/main_helper.rs'] = 'pub fn helper() {}\n',
+  ['src/main_utils.rs'] = 'pub fn util() {}\n',
+  ['src/main_runner.rs'] = 'pub fn run() {}\n',
+  ['src/main_loop.rs'] = 'pub fn loop_() {}\n',
   ['src/lib.rs'] = 'pub fn it_works() -> i32 { 42 }\n',
   ['src/utils.rs'] = 'pub fn helper() {}\n',
+  ['src/parser.rs'] = 'pub fn parse() {}\n',
+  ['src/runner.rs'] = 'pub fn run() {}\n',
+  ['src/state.rs'] = 'pub struct State {}\n',
+  ['src/config.rs'] = 'pub struct Config {}\n',
+  ['src/error.rs'] = 'pub enum Error {}\n',
+  ['src/types.rs'] = 'pub type Id = u64;\n',
+  ['src/store.rs'] = 'pub struct Store {}\n',
+  ['src/api.rs'] = 'pub fn api() {}\n',
+  ['src/cli.rs'] = 'pub fn cli() {}\n',
   ['src/components/button.tsx'] = 'export const Button = () => null\n',
   ['src/components/input.tsx'] = 'export const Input = () => null\n',
+  ['src/components/dialog.tsx'] = 'export const Dialog = () => null\n',
+  ['src/components/menu.tsx'] = 'export const Menu = () => null\n',
+  ['src/components/list.tsx'] = 'export const List = () => null\n',
+  ['src/components/table.tsx'] = 'export const Table = () => null\n',
   ['docs/intro.md'] = '# Intro\n',
   ['docs/guide.md'] = '# Guide\n',
+  ['docs/reference.md'] = '# Reference\n',
+  ['docs/changelog.md'] = '# Changelog\n',
+  ['docs/contributing.md'] = '# Contributing\n',
+  ['docs/license.md'] = '# License\n',
+  ['tests/main_test.rs'] = '#[test] fn main_test() {}\n',
+  ['tests/integration.rs'] = '#[test] fn it() {}\n',
+  ['tests/regression.rs'] = '#[test] fn regress() {}\n',
 }
 
 --- @class fff.snapshot.Fixture

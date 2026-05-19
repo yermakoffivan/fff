@@ -1876,14 +1876,12 @@ local function build_render_context()
   M.state.next_search_force_combo_boost = false
 
   if combo_info and M.state.combo_visible then
-    -- Separator is always rendered after the anchor in iter order. With a top
-    -- prompt that lands the divider visually BELOW the match -> arrow up.
-    -- With a bottom prompt the iter is reversed, so it lands ABOVE the match
-    -- -> arrow down. Always points back at the anchor.
-    local arrow = prompt_position == 'bottom' and '↓' or '↑'
+    -- Text is finalised in finalize_render once we know whether the
+    -- separator landed visually above or below the match (depends on iter
+    -- direction + which end of the iter the anchor sits on).
     separator = {
       idx = combo_info.idx,
-      text = arrow .. ' ' .. combo_info.text,
+      text = combo_info.text,
       text_hl = config.hl.combo_header,
       border_hl = config.hl.border,
     }
@@ -1895,6 +1893,20 @@ local function build_render_context()
   -- Determine iteration order
   local display_start = 1
   local display_end = #items
+
+  -- Reserve one row for the separator gap when present. Without this, items
+  -- fill the list to the brim, the gap overflows the window, and the
+  -- separator float (positioned by buffer line) gets clipped or drawn on
+  -- top of the input border. Drop the item at the far end of the items
+  -- list, opposite the anchor — that's the row farthest from the prompt.
+  if separator and (display_end - display_start + 1) >= win_height then
+    if separator.idx == display_start then
+      display_end = display_end - 1
+    else
+      display_start = display_start + 1
+    end
+  end
+
   local iter_start, iter_end, iter_step
   if prompt_position == 'bottom' then
     iter_start, iter_end, iter_step = display_end, display_start, -1
@@ -1928,16 +1940,22 @@ local function build_render_context()
   }
 end
 
-local function finalize_render(separator_line, ctx)
+local function finalize_render(separator_line, _item_to_lines, ctx)
   if ctx.separator and separator_line then
+    -- Arrow points toward the prompt: matches sit between the separator and
+    -- the prompt, so the arrow visually leads the eye from "rest of list"
+    -- through the separator toward the match + prompt.
+    local arrow = ctx.prompt_position == 'bottom' and '↓' or '↑'
+
     local list_cfg = vim.api.nvim_win_get_config(M.state.list_win)
-    -- list_cfg.row sits on the top border; content starts at list_cfg.row + 1.
+    -- list_cfg.row is on the top border; content starts at list_cfg.row + 1.
     -- separator_line is 1-based -> add directly.
     local screen_row = list_cfg.row + separator_line
+
     list_separator.update({
       list_win = M.state.list_win,
       row = screen_row,
-      text = ctx.separator.text,
+      text = arrow .. ' ' .. ctx.separator.text,
       text_hl = ctx.separator.text_hl,
       border_hl = ctx.separator.border_hl,
     })
@@ -1962,12 +1980,13 @@ function M.render_list()
     return
   end
 
-  local separator_line = list_renderer.render(ctx, M.state.list_buf, M.state.list_win, M.state.ns_id)
+  local separator_line, item_to_lines =
+    list_renderer.render(ctx, M.state.list_buf, M.state.list_win, M.state.ns_id)
   -- For bottom prompt, always ensure content is anchored at the bottom after rendering
   -- This prevents results from appearing in the middle when there are few items
   if ctx.prompt_position == 'bottom' then scroll_to_bottom() end
 
-  finalize_render(separator_line, ctx)
+  finalize_render(separator_line, item_to_lines, ctx)
 end
 
 --- Build and set the preview window title for a given item and location.

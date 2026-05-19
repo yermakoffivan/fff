@@ -73,7 +73,7 @@ local function teardown()
 end
 
 --- @param opts table|nil { ignore_text?: number[] }
-local function match(opts)
+local function assert_snapshot_match(opts)
   opts = opts or {}
   MiniTest.expect.reference_screenshot(child.get_screenshot(), nil, {
     force = FORCE,
@@ -96,18 +96,15 @@ local function open_picker(prompt_position, query)
   end
 end
 
-local GEOMETRIES = {
-  -- `default` must stay above the layout.flex.size threshold (130) so the
-  -- preview lands side-by-side instead of wrapping to top/bottom; that's the
-  -- view real users see and the only one where the debug panel exists.
+local LAYOUTS = {
   { name = 'wide', cols = 180, rows = 40, winborder = 'double' },
-  { name = 'default', cols = 140, rows = 32 },
+  { name = 'default', cols = 140, rows = 32 }, -- standard on most screens
   { name = 'narrow', cols = 70, rows = 24, winborder = 'rounded' },
 }
 
 local T = MiniTest.new_set()
 
-for _, geometry in ipairs(GEOMETRIES) do
+for _, geometry in ipairs(LAYOUTS) do
   local set = MiniTest.new_set({
     hooks = {
       pre_case = function() setup(geometry) end,
@@ -117,29 +114,29 @@ for _, geometry in ipairs(GEOMETRIES) do
 
   set['empty_bottom'] = function()
     open_picker('bottom')
-    match()
+    assert_snapshot_match()
   end
 
   set['empty_top'] = function()
     open_picker('top')
-    match()
+    assert_snapshot_match()
   end
 
   set['query_main_bottom'] = function()
     open_picker('bottom', 'main')
-    match()
+    assert_snapshot_match()
   end
 
   set['no_results_bottom'] = function()
     open_picker('bottom', 'zzzzzzzzz')
-    match()
+    assert_snapshot_match()
   end
 
   set['cursor_second_item'] = function()
     open_picker('bottom')
     child.type_keys('<Down>')
     vim.loop.sleep(200)
-    match()
+    assert_snapshot_match()
   end
 
   T[geometry.name] = set
@@ -147,18 +144,19 @@ end
 
 -- File info panel only renders in non-flex layouts where there's room for it,
 -- so we only exercise it on the default geometry.
-local default_geom = GEOMETRIES[2]
+local default_geom = LAYOUTS[2]
 local debug_set = MiniTest.new_set({
   hooks = {
     pre_case = function() setup(default_geom, { debug = true }) end,
     post_case = teardown,
   },
 })
+
 debug_set['file_info_panel'] = function()
   open_picker('bottom', 'main')
   -- Modified / Last Access timestamps drift between runs; ignore those text
   -- rows but still verify everything else (panel layout, scores, attrs).
-  match({ ignore_text = { 13, 14 } })
+  assert_snapshot_match({ ignore_text = { 13, 14 } })
 end
 T['debug'] = debug_set
 
@@ -191,14 +189,34 @@ T['combo']['boost_bottom'] = function()
   open_picker('bottom', 'main')
   -- Combo overlay float renders asynchronously after render_list.
   vim.loop.sleep(400)
-  match()
+  assert_snapshot_match()
 end
 
 T['combo']['boost_top'] = function()
   train_combo()
   open_picker('top', 'main')
   vim.loop.sleep(400)
-  match()
+  assert_snapshot_match()
+end
+
+T['scrollbar'] = MiniTest.new_set({
+  hooks = {
+    pre_case = function() setup({ cols = 140, rows = 32 }) end,
+    post_case = teardown,
+  },
+})
+
+T['scrollbar']['next_page'] = function()
+  open_picker('bottom')
+  -- Bottom prompt iters in reverse — `<Up>` advances cursor toward higher
+  -- indices (visually up the list). Walking past the last in-page item
+  -- triggers load_next_page; the scrollbar thumb appears at the new offset.
+  for _ = 1, 30 do
+    child.type_keys('<Up>')
+    vim.loop.sleep(20)
+  end
+  vim.loop.sleep(400)
+  assert_snapshot_match()
 end
 
 return T
