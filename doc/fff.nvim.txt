@@ -1,5 +1,5 @@
 *fff.nvim.txt*
-                              For Neovim >= 0.10.0    Last change: 2026 May 18
+                              For Neovim >= 0.10.0    Last change: 2026 May 19
 
 ==============================================================================
 Table of Contents                                 *fff.nvim-table-of-contents*
@@ -232,7 +232,7 @@ Defaults are sensible. Override only what you care about.
         preview_size = 0.5,
         flex = { size = 130, wrap = 'top' },
         show_scrollbar = true,
-        path_shorten_strategy = 'middle_number', -- 'middle_number' | 'middle' | 'end'
+        path_shorten_strategy = 'middle_number', -- 'middle_number' | 'middle' | 'end' | 'start'
         anchor = 'center',
       },
       preview = {
