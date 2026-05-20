@@ -153,12 +153,19 @@ local function ensure_indexed(cwd, wait_for_index_ms)
   require('fff.core').ensure_initialized()
   local config = require('fff.conf').get()
 
+  local is_windows = vim.fn.has('win32') == 1
   local function canon(p)
     if not p or p == '' then return '' end
     local abs = vim.fn.fnamemodify(vim.fn.expand(p), ':p')
-    abs = (abs:gsub('/+$', ''))
-    local ok, resolved = pcall(vim.fn.resolve, abs)
-    return vim.fs.normalize((ok and resolved ~= '') and resolved or abs)
+    abs = (abs:gsub('[/\\]+$', ''))
+    -- fs_realpath resolves Windows 8.3 short names (RUNNER~1 -> runneradmin)
+    -- so picker base_path (canonicalized in rust) compares equal to the cwd
+    -- argument. fnamemodify(':p') alone keeps the short form on Windows.
+    local realpath_ok, realpath = pcall(vim.uv.fs_realpath, abs)
+    if realpath_ok and realpath then abs = realpath end
+    local normalized = vim.fs.normalize(abs)
+    if is_windows then normalized = normalized:lower() end
+    return normalized
   end
 
   local cwd_triggered_reindex = false
@@ -168,8 +175,7 @@ local function ensure_indexed(cwd, wait_for_index_ms)
     if vim.fn.isdirectory(expanded) ~= 1 then return false, 'cwd does not exist: ' .. expanded end
 
     if canon(config.base_path) ~= canon(expanded) then
-      local picker_ui = require('fff.picker_ui')
-      if not picker_ui.change_indexing_directory(expanded) then
+      if not require('fff.core').change_indexing_directory(expanded) then
         return false, 'failed to change indexing directory to ' .. expanded
       end
       cwd_triggered_reindex = true
@@ -438,90 +444,6 @@ local function strip_path_wrappers(s)
   s = s:gsub('^%./', '')
   s = s:gsub('^%.\\', '')
   return s
-end
-
---- Try to open the file/path under the cursor.
----
---- Picks up the `<cWORD>` (whitespace-delimited token) from the current line,
---- strips wrapping punctuation (`[]`, `()`, quotes, `./` prefix, trailing
---- `,`/`.`/etc.), searches the picker index for a match, and:
----
----   * If the top hit is an exact-path / exact-filename match, or only a
----     single result came back, opens it with `:edit` (resolved against the
----     picker's `base_path`, which may differ from neovim's cwd).
----   * If `:edit` would fail because the current window has `winfixbuf` or a
----     special buftype, retargets to a suitable window or falls back to
----     `:split`.
----   * If the cWORD matches several files ambiguously without a clear top
----     hit, opens the picker UI with the cWORD as a starter query.
----   * If the cWORD is empty or matches nothing, does nothing — no surprise
----     UI popup.
----
---- The optional `open_cb` is invoked **before** `:edit` runs with
---- `(absolute_path, relative_path)` — useful for plugins that want to mirror
---- the open into a side panel, log the access, etc.
---- @param open_cb fun(abs_path: string, relative_path: string)|nil
-function M.open_file_under_cursor(open_cb)
-  local raw_word = vim.fn.expand('<cWORD>')
-  local query = strip_path_wrappers(raw_word)
-  if not query or query == '' then return end
-
-  local picker_ok, picker_ui = pcall(require, 'fff.picker_ui')
-  if not picker_ok then
-    vim.notify('Failed to load picker UI', vim.log.levels.ERROR)
-    return
-  end
-
-  picker_ui.open_with_callback(query, function(files, _, location, get_file_score)
-    -- Empty results: don't pop up the picker UI on words that aren't paths.
-    if not files or #files == 0 then return true end
-
-    local first_score = get_file_score and get_file_score(1) or nil
-    local exact = first_score and first_score.exact_match or false
-    if #files ~= 1 and not exact then
-      -- Ambiguous: let the picker UI surface the candidates.
-      return false
-    end
-
-    local utils = require('fff.utils')
-    local item = files[1]
-    local abs_path = utils.canonicalize_fff_path(item.relative_path)
-    if not abs_path then return true end
-    local cwd_relative = vim.fn.fnamemodify(abs_path, ':.')
-
-    if open_cb and type(open_cb) == 'function' then
-      local cb_ok, cb_err = pcall(open_cb, abs_path, item.relative_path)
-      if not cb_ok then
-        vim.notify('open_file_under_cursor open_cb error: ' .. tostring(cb_err), vim.log.levels.ERROR)
-      end
-    end
-
-    -- Mirror M.select's window-targeting logic: the current window may be
-    -- locked (winfixbuf / special buftype), in which case `:edit` raises
-    -- E1513. Retarget to a usable window or split.
-    local current_win = vim.api.nvim_get_current_win()
-    local current_buf = vim.api.nvim_get_current_buf()
-    local current_buftype = vim.api.nvim_get_option_value('buftype', { buf = current_buf })
-    local current_modifiable = vim.api.nvim_get_option_value('modifiable', { buf = current_buf })
-    local current_winfixbuf = utils.window_has_winfixbuf(current_win)
-
-    local opened_via_split = false
-    if current_buftype ~= '' or not current_modifiable or current_winfixbuf then
-      local suitable_win = utils.find_suitable_window()
-      if suitable_win then
-        vim.api.nvim_set_current_win(suitable_win)
-      elseif current_winfixbuf then
-        vim.cmd('split ' .. vim.fn.fnameescape(cwd_relative))
-        opened_via_split = true
-      end
-    end
-
-    if not opened_via_split then vim.cmd('edit ' .. vim.fn.fnameescape(cwd_relative)) end
-
-    if location then vim.schedule(function() require('fff.location_utils').jump_to_location(location) end) end
-
-    return true
-  end)
 end
 
 -- Split a `path:line:col` or `path:line` suffix off a path candidate.

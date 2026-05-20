@@ -1,9 +1,17 @@
 ---@diagnostic disable: undefined-field, missing-fields
+local plugin_dir = vim.fn.fnamemodify(vim.fn.resolve(debug.getinfo(1, 'S').source:sub(2)), ':h:h')
+local log_file = vim.fs.normalize(plugin_dir .. '/fff-test.log')
+pcall(vim.fn.delete, log_file)
+
+-- init_tracing uses OnceLock — first caller wins. Direct rust call BEFORE any
+-- fff.* require, otherwise core.ensure_initialized() locks tracing to the
+-- default config path and our trace dump on CI failure stays empty.
+pcall(require('fff.rust').init_tracing, log_file, 'trace')
+
 local fff = require('fff')
 local fff_rust = require('fff.rust')
 local file_picker = require('fff.file_picker')
 
-local plugin_dir = vim.fn.fnamemodify(vim.fn.resolve(debug.getinfo(1, 'S').source:sub(2)), ':h:h')
 local function init_picker_at_plugin_dir(timeout_ms)
   fff_rust.init_file_picker(plugin_dir)
   vim.wait(100, function() return false end)
@@ -44,10 +52,12 @@ describe('programmatic search APIs', function()
 
         local hit = find_result_by_name(result.items, 'programmatic_search_spec.lua')
         assert.is_not_nil(hit, 'this spec file should appear in its own search results')
+        ---@cast hit -nil
         assert.are.equal('file', hit.type)
         assert.is_string(hit.relative_path)
+        local normalized = vim.fs.normalize(hit.relative_path)
         assert.is_true(
-          hit.relative_path:find('tests/', 1, true) ~= nil,
+          normalized:find('tests/', 1, true) ~= nil,
           'expected relative_path under tests/, got ' .. tostring(hit.relative_path)
         )
         assert.is_number(hit.size)
@@ -59,7 +69,7 @@ describe('programmatic search APIs', function()
 
         local lua_dir
         for _, item in ipairs(result.items) do
-          if item.name == 'file_picker' and item.relative_path:find('lua/fff/', 1, true) then
+          if item.name == 'file_picker' and vim.fs.normalize(item.relative_path):find('lua/fff/', 1, true) then
             lua_dir = item
             break
           end

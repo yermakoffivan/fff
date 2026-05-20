@@ -14,7 +14,6 @@ local layout = require('fff.layout')
 
 local canonicalize_fff_path = utils.canonicalize_fff_path
 
-
 local preview_config = conf.get().preview
 if preview_config then preview.setup(preview_config) end
 
