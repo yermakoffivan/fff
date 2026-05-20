@@ -90,9 +90,13 @@ get_latest_release_tag() {
     local releases_json
     local curl_args=(-fsSL)
 
-    # Use GitHub token if available to avoid rate limiting
-    if [ -n "${GITHUB_TOKEN:-}" ]; then
-        curl_args+=(-H "Authorization: token $GITHUB_TOKEN")
+    # Use gh CLI token if available to avoid rate limiting
+    if command -v gh &>/dev/null; then
+        local gh_token
+        gh_token="$(gh auth token 2>/dev/null || true)"
+        if [ -n "$gh_token" ]; then
+            curl_args+=(-H "Authorization: token $gh_token")
+        fi
     fi
 
     releases_json=$(curl "${curl_args[@]}" "https://api.github.com/repos/${REPO}/releases") \
