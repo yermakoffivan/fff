@@ -1,13 +1,4 @@
----@diagnostic disable: undefined-field
 --- End-to-end snapshot tests for fff.nvim's picker UI.
----
---- Spawns a fresh child Neovim per case, drives the picker like a real user,
---- and asserts the resulting screen matches a checked-in reference under
---- `tests/screenshots/`.
----
---- Run with `make test-lua-snap`. Accept intentional UI changes with
---- `UPDATE_SNAPSHOTS=1 make test-lua-snap`.
-
 local MiniTest = require('mini.test')
 local fixture_lib = require('tests.snapshot.fixture')
 
@@ -82,12 +73,7 @@ local function assert_snapshot_match(opts)
 end
 
 local function open_picker(prompt_position, query)
-  child.lua(
-    string.format(
-      'require("fff.picker_ui").open({ layout = { prompt_position = %q } })',
-      prompt_position
-    )
-  )
+  child.lua(string.format('require("fff.picker_ui").open({ layout = { prompt_position = %q } })', prompt_position))
   vim.loop.sleep(400)
 
   if query and query ~= '' then
@@ -173,11 +159,7 @@ local function train_combo()
   -- + final settle for the lmdb writer.
   for _ = 1, 4 do
     child.lua(
-      string.format(
-        'require("fff.rust").track_query_completion(%q, %q)',
-        'main',
-        fixture.root .. '/src/main.rs'
-      )
+      string.format('require("fff.rust").track_query_completion(%q, %q)', 'main', fixture.root .. '/src/main.rs')
     )
     vim.loop.sleep(120)
   end

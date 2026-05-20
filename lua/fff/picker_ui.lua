@@ -339,9 +339,8 @@ local function build_window_configs(layout, config)
   -- is also the preview's top/bottom edge row — i.e. the picker's outer
   -- top/bottom edge AND no input/preview is stacked above/below the list at
   -- that side.
-  local list_top_at_picker_top = (not list_neighbour_preview_top) and (not list_neighbour_input_top)
-  local list_bottom_at_picker_bottom = (not list_neighbour_preview_bottom)
-    and (not list_neighbour_input_bottom)
+  local list_top_at_picker_top = (not list_neighbour_preview_top) and not list_neighbour_input_top
+  local list_bottom_at_picker_bottom = (not list_neighbour_preview_bottom) and not list_neighbour_input_bottom
 
   -- Top corners only get an `up` stem if something is genuinely above this
   -- row (input or preview stacked above). A side preview shares the column
@@ -1980,8 +1979,7 @@ function M.render_list()
     return
   end
 
-  local separator_line, item_to_lines =
-    list_renderer.render(ctx, M.state.list_buf, M.state.list_win, M.state.ns_id)
+  local separator_line, item_to_lines = list_renderer.render(ctx, M.state.list_buf, M.state.list_win, M.state.ns_id)
   -- For bottom prompt, always ensure content is anchored at the bottom after rendering
   -- This prevents results from appearing in the middle when there are few items
   if ctx.prompt_position == 'bottom' then scroll_to_bottom() end
@@ -2146,11 +2144,7 @@ function M.update_preview()
     preview.update_file_info_buffer(item, M.state.file_info_buf, M.state.cursor)
     if M.state.file_info_win and vim.api.nvim_win_is_valid(M.state.file_info_win) then
       local rel = item.relative_path or item.path or ''
-      pcall(
-        vim.api.nvim_win_set_config,
-        M.state.file_info_win,
-        { title = ' ' .. rel .. ' ', title_pos = 'left' }
-      )
+      pcall(vim.api.nvim_win_set_config, M.state.file_info_win, { title = ' ' .. rel .. ' ', title_pos = 'left' })
     end
   end
 
@@ -2244,13 +2238,11 @@ function M.update_status(progress)
     local win_width = vim.api.nvim_win_get_width(M.state.input_win)
     local available_width = win_width - 2
 
-    local virt_text
     if fallback_label then
       local total_len = #fallback_label
       local col_position = available_width - total_len
-      virt_text = { { fallback_label, 'DiagnosticWarn' } }
       vim.api.nvim_buf_set_extmark(M.state.input_buf, M.state.ns_id, 0, 0, {
-        virt_text = virt_text,
+        virt_text = { { fallback_label, 'DiagnosticWarn' } },
         virt_text_win_col = col_position,
       })
     else

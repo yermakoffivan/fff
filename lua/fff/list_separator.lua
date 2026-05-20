@@ -1,20 +1,9 @@
---- List Separator
---- Renders a single full-width horizontal divider over the list window,
---- overflowing the left/right list borders so it visually breaks the list.
----
---- Stateless API: callers pass desired text + screen row + width on every
---- update. The module owns one float + one buffer; it shows/hides/repositions.
----
---- Generic by design — combo headers are one consumer; grep group headers or
---- other pinned dividers can reuse the same module.
+-- Renders list separator at any index, designed to be floating on top of list renderer
 local M = {}
 
 local LEFT_PADDING = 2
 local RIGHT_PADDING = 1
--- nvim_win_get_config().col / .width describe the bordered float as a whole:
--- col is the column of the LEFT border `│`, width is the INNER content width.
--- We want our `├ ─...─ ┤` to overlap both border verticals, so the separator
--- spans `width + 2` columns and starts at the same `col` as the list.
+-- overflow BOTH borders on left and right
 local OVERFLOW_TOTAL = 2
 
 local state = {
@@ -58,8 +47,7 @@ local function build_line(total_width, text)
   return content, label_byte_start, #label
 end
 
---- Render or reposition the separator. Idempotent — skips work when nothing
---- changed since the last call.
+--- Render or reposition the separator
 --- @param opts FffSeparatorOpts
 function M.update(opts)
   local list_cfg = vim.api.nvim_win_get_config(opts.list_win)
@@ -73,11 +61,8 @@ function M.update(opts)
   local col = list_col
   local row = opts.row
 
-  local key =
-    string.format('%d|%d|%d|%s|%s|%s', row, col, total_width, opts.text, opts.text_hl, opts.border_hl)
-  if state.last == key and state.win and vim.api.nvim_win_is_valid(state.win) then
-    return
-  end
+  local key = string.format('%d|%d|%d|%s|%s|%s', row, col, total_width, opts.text, opts.text_hl, opts.border_hl)
+  if state.last == key and state.win and vim.api.nvim_win_is_valid(state.win) then return end
 
   local buf = get_or_create_buf()
   local content, label_byte_start, label_byte_len = build_line(total_width, opts.text)
@@ -100,6 +85,7 @@ function M.update(opts)
   end
   vim.api.nvim_set_option_value('modifiable', false, { buf = buf })
 
+  -- the actual fake floating window
   local win_cfg = {
     relative = 'editor',
     width = total_width,

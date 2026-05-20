@@ -1,17 +1,4 @@
---- List Renderer
---- Handles all list rendering: line generation, virtual rows, bottom padding,
---- buffer writes, cursor positioning, and highlight application.
----
---- Virtual rows (combo headers, grep file group headers) are decorations that
---- belong to buffer rendering, NOT to the data model. The cursor and selection
---- always operate on the items array (1-based indices), never on buffer lines.
----
---- Pagination is unaffected: Rust returns N items per page. The renderer may
---- produce N + K buffer lines (where K = number of virtual header rows), but
---- the page_size contract with Rust stays item-based.
----
---- Selection always operates on item.relative_path keys. Virtual rows have no identity
---- of their own — they derive from the item they belong to.
+--- List Renderer, renders any type of list results produced by fff
 local M = {}
 
 --- @class ListRenderContext
@@ -57,7 +44,7 @@ local M = {}
 --- @field text_hl string|nil Highlight group for label
 --- @field border_hl string|nil Highlight group for the dashes
 
---- Generate all display lines from items from the rendere ctx
+--- Generate all display lines from items from the renderer ctx
 --- @param ctx table
 --- @return string[] lines Array of line strings
 --- @return table<number, ItemLineMapping> item_to_lines
