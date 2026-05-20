@@ -37,6 +37,14 @@ irm https://raw.githubusercontent.com/dmtrKovalenko/fff.nvim/main/install-mcp.ps
 
 The scripts live at [`install-mcp.sh`](./install-mcp.sh) and [`install-mcp.ps1`](./install-mcp.ps1) if you want to read them first.
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew install gustav-fff/tap/fff-mcp
+```
+
+Community-maintained tap at [gustav-fff/homebrew-tap](https://github.com/gustav-fff/homebrew-tap). Pulls the prebuilt binary from the GitHub release assets.
+
 It prints the exact wiring instructions for your client. Once the server is connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`, and `fff-multi-grep` tools.
 
 ### Recommended agent prompt
