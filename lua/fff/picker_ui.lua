@@ -1971,14 +1971,10 @@ function M.update_status(progress)
     local fallback_label = nil
     if M.state.grep_regex_fallback_error then fallback_label = 'invalid regex, using literal' end
 
-    -- If only one mode configured and no fallback error, hide the mode indicator completely
-    if #modes <= 1 and not fallback_label then
-      -- Clear any existing status and don't show anything
-      vim.api.nvim_buf_clear_namespace(M.state.input_buf, M.state.ns_id, 0, -1)
-      M.state.last_status_info = nil
-      return
-    end
+    -- Result count info
+    local result_count = M.state.pagination.total_matched or 0
 
+    -- Build status components
     local keybind = config.keymaps.cycle_grep_modes
     -- Normalize: if it's a table of keys, use the first one for display
     if type(keybind) == 'table' then keybind = keybind[1] or '<S-Tab>' end
@@ -1998,7 +1994,9 @@ function M.update_status(progress)
       hl = config.hl.grep_fuzzy_active or 'DiagnosticHint'
     end
 
-    local cache_key = keybind .. M.state.grep_mode .. (fallback_label or '')
+    local show_mode_indicator = #modes > 1 or fallback_label
+
+    local cache_key = keybind .. M.state.grep_mode .. (fallback_label or '') .. result_count
     if cache_key == M.state.last_status_info then return end
     M.state.last_status_info = cache_key
 
@@ -2007,8 +2005,9 @@ function M.update_status(progress)
     local win_width = vim.api.nvim_win_get_width(M.state.input_win)
     local available_width = win_width - 2
 
-    local virt_text
+    local virt_text = {}
     if fallback_label then
+      -- Fallback error: show warning (no mode indicator or result count)
       local total_len = #fallback_label
       local col_position = available_width - total_len
       virt_text = { { fallback_label, 'DiagnosticWarn' } }
@@ -2017,15 +2016,31 @@ function M.update_status(progress)
         virt_text_win_col = col_position,
       })
     else
-      local total_len = #keybind + 1 + #mode_label
-      local col_position = available_width - total_len
-      vim.api.nvim_buf_set_extmark(M.state.input_buf, M.state.ns_id, 0, 0, {
-        virt_text = {
-          { keybind .. ' ', hl },
-          { mode_label, hl },
-        },
-        virt_text_win_col = col_position,
-      })
+      -- Build status: mode indicator (if multiple modes) + separator + result count
+      local separator = ' │ '
+      local result_text = 'results: ' .. result_count
+
+      if show_mode_indicator then
+        -- Show both mode indicator and result count
+        local status_text = keybind .. ' ' .. mode_label .. separator .. result_text
+        local col_position = available_width - vim.fn.strdisplaywidth(status_text)
+        vim.api.nvim_buf_set_extmark(M.state.input_buf, M.state.ns_id, 0, 0, {
+          virt_text = {
+            { keybind .. ' ', hl },
+            { mode_label, hl },
+            { separator, 'Comment' },
+            { result_text, 'LineNr' },
+          },
+          virt_text_win_col = col_position,
+        })
+      else
+        -- Only one mode: just show result count
+        local col_position = available_width - vim.fn.strdisplaywidth(result_text)
+        vim.api.nvim_buf_set_extmark(M.state.input_buf, M.state.ns_id, 0, 0, {
+          virt_text = { { result_text, 'LineNr' } },
+          virt_text_win_col = col_position,
+        })
+      end
     end
     return
   end
