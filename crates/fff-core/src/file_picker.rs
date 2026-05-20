@@ -1738,8 +1738,8 @@ impl FileSync {
         allowlist: &[String],
         denylist: &[String],
     ) -> Result<FileSync, Error> {
-        use ignore::WalkBuilder;
         use globset::{Glob, GlobSetBuilder};
+        use ignore::WalkBuilder;
 
         let scan_start = std::time::Instant::now();
         info!("SCAN: Starting filesystem walk and git status (async)");
