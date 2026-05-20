@@ -857,6 +857,11 @@ M.state = {
   -- suggestion_source: 'grep' (suggestions from grep) or 'files' (suggestions from file search)
   suggestion_items = nil,
   suggestion_source = nil,
+
+  -- When set, M.select skips the default :edit/:split machinery and invokes
+  -- this callback with the selected item. Used by find_files/live_grep to
+  -- let callers handle the selected file directly.
+  on_submit = nil,
 }
 
 function M.create_ui()
@@ -2811,6 +2816,7 @@ function M.select(action)
   local query = M.state.query -- Capture query before closing for tracking
   local mode = M.state.mode -- Capture mode before closing for tracking
   local suggestion_source = M.state.suggestion_source -- Capture suggestion context
+  local on_submit = M.state.on_submit -- Capture callback before closing
 
   -- In grep mode (or when selecting a grep suggestion), derive location from the match item
   local is_grep_item = mode == 'grep' or suggestion_source == 'grep'
@@ -2841,7 +2847,17 @@ function M.select(action)
   vim.cmd('stopinsert')
   M.close()
 
-  if action == 'edit' then
+  if type(on_submit) == 'function' then
+    local ok, err = pcall(on_submit, item, {
+      action = action,
+      path = abs_path,
+      relative_path = relative_path,
+      location = location,
+      mode = mode,
+      query = query,
+    })
+    if not ok then vim.notify('FFF on_submit callback error: ' .. tostring(err), vim.log.levels.ERROR) end
+  elseif action == 'edit' then
     local current_win = vim.api.nvim_get_current_win()
     local current_buf = vim.api.nvim_get_current_buf()
     local current_buftype = vim.api.nvim_get_option_value('buftype', { buf = current_buf })
@@ -2874,6 +2890,7 @@ function M.select(action)
 
   -- Derive side effects on vim schedule to ensure they run after the file is opened
   vim.schedule(function()
+    if on_submit then return end -- callback owns post-select side effects
     if location then location_utils.jump_to_location(location) end
 
     if query and query ~= '' then
@@ -2999,6 +3016,7 @@ function M.close()
   M.state.grep_regex_fallback_error = nil
   M.state.suggestion_items = nil
   M.state.suggestion_source = nil
+  M.state.on_submit = nil
   M.state.restore_paste = false
   M.state.combo_visible = true
   M.state.combo_initial_cursor = nil
@@ -3147,15 +3165,21 @@ function M.open_with_callback(query, callback, opts)
 end
 
 --- Open the file picker UI
---- @param opts? {cwd?: string, title?: string, prompt?: string, max_results?: number, max_threads?: number, layout?: {width?: number|function, height?: number|function, prompt_position?: string|function, preview_position?: string|function, preview_size?: number|function}, renderer?: table, mode?: string, grep_config?: table, query?: string} Optional configuration to override defaults
+--- @param opts? {cwd?: string, title?: string, prompt?: string, max_results?: number, max_threads?: number, layout?: {width?: number|function, height?: number|function, prompt_position?: string|function, preview_position?: string|function, preview_size?: number|function}, renderer?: table, mode?: string, grep_config?: table, query?: string, on_submit?: fun(item: table, ctx: {action: string, path: string, relative_path: string, location: table|nil, mode: string|nil, query: string})} Optional configuration to override defaults
 function M.open(opts)
   if M.state.active then return end
+
+  if opts and opts.on_submit ~= nil and type(opts.on_submit) ~= 'function' then
+    vim.notify('FFF: opts.on_submit must be a function', vim.log.levels.ERROR)
+    return
+  end
 
   M.state.selected_files = {}
   M.state.selected_items = {}
   M.state.renderer = opts and opts.renderer or nil
   M.state.mode = opts and opts.mode or nil
   M.state.grep_config = opts and opts.grep_config or nil
+  M.state.on_submit = opts and opts.on_submit or nil
 
   local merged_config, base_path = initialize_picker(opts)
   if not merged_config then return end

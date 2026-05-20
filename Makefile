@@ -68,12 +68,14 @@ test-rust:
 test-lua: test-setup build
 	@output=$$(nvim --headless -u tests/minimal_init.lua \
 		-c "PlenaryBustedDirectory tests/ {minimal_init = 'tests/minimal_init.lua'}" 2>&1); \
+	rc=$$?; \
 	echo "$$output"; \
 	if echo "$$output" | grep -qE "SIG(SEGV|ABRT|BUS|FPE|ILL)"; then \
 		echo ""; \
 		echo "FAIL: native crash detected during lua tests"; \
 		exit 1; \
-	fi
+	fi; \
+	exit $$rc
 
 # mini.test reference_screenshot snapshots. Separate runner because mini.test
 # spawns child processes and uses its own collector (incompatible with
@@ -81,12 +83,14 @@ test-lua: test-setup build
 test-lua-snap: test-setup build
 	@output=$$(nvim --headless -u tests/minimal_init.lua \
 		-c "lua require('mini.test').run_file('tests/picker_ui_snap.lua')" 2>&1); \
+	rc=$$?; \
 	echo "$$output"; \
 	if echo "$$output" | grep -qE "SIG(SEGV|ABRT|BUS|FPE|ILL)"; then \
 		echo ""; \
 		echo "FAIL: native crash detected during snapshot tests"; \
 		exit 1; \
-	fi
+	fi; \
+	exit $$rc
 
 test-version: test-setup
 	nvim --headless -u tests/minimal_init.lua \

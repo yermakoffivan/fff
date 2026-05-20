@@ -285,6 +285,31 @@ require('fff').live_grep({ grep = { modes = { 'fuzzy', 'plain' } } })
 require('fff').live_grep({ query = 'search term' }) -- pre-fill
 ```
 
+### Custom select handler (`on_submit`)
+
+Both `find_files` and `live_grep` accept an `on_submit` callback. When provided, the picker calls your callback with the selected item and skips its default `:edit`/split machinery — useful for embedding the picker into other plugins (e.g. inserting a link, sending a path to an external tool).
+
+```lua
+require('fff').find_files({
+  on_submit = function(item, ctx)
+    -- item: raw picker item (relative_path, name, ...)
+    -- ctx.action: 'edit' | 'split' | 'vsplit' | 'tab' (which keymap was used)
+    -- ctx.path: absolute path resolved against the indexer's base_path
+    -- ctx.relative_path: cwd-relative path for nicer display
+    -- ctx.location: { line, col } for grep matches, otherwise nil
+    -- ctx.mode: 'grep' | nil
+    -- ctx.query: the active search query
+    vim.notify('picked ' .. ctx.path)
+  end,
+})
+
+require('fff').live_grep({
+  on_submit = function(item, ctx)
+    vim.fn.setreg('+', ctx.path .. ':' .. (ctx.location and ctx.location.line or 1))
+  end,
+})
+```
+
 ### Constraints
 
 Both find and grep accept these tokens to refine a query:

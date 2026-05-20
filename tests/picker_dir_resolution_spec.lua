@@ -8,25 +8,7 @@
 local fff_rust = require('fff.rust')
 local picker_ui = require('fff.picker_ui')
 local file_picker = require('fff.file_picker')
-
---- Normalise a path so that comparisons work on every OS.
---- Windows complicates things: Rust may return forward-slash paths while
---- vim.fn.resolve uses backslashes, temp paths may contain 8.3 short names
---- (RUNNER~1), and the filesystem is case-insensitive.
---- vim.uv.fs_realpath expands 8.3 names on Windows (unlike vim.fn.resolve).
---- @param p string
---- @return string
-local function norm(p)
-  -- fs_realpath is the closest Lua equivalent of Rust's std::fs::canonicalize
-  -- and expands 8.3 short names on Windows.
-  local rp = vim.uv.fs_realpath(p) or vim.fn.fnamemodify(vim.fn.resolve(p), ':p')
-  local n = vim.fs.normalize(rp)
-  -- Strip trailing slash for consistent comparison
-  n = n:gsub('/$', '')
-  -- Case-fold on Windows (drive letters, 8.3 short names, etc.)
-  if vim.fn.has('win32') == 1 then n = n:lower() end
-  return n
-end
+local norm = require('tests.utils').normalize
 
 --- `change_indexing_directory` swaps the picker on a background thread, so the
 --- `FILE_PICKER` global may still point at the *old* picker for a moment —
