@@ -54,20 +54,13 @@ function M.render_line(item, ctx, item_idx) -- luacheck: ignore item_idx
   local available_width = math.max(ctx.max_path_width - icon_width, 40)
   local filename, dir_path = ctx.format_file_display(item, available_width)
 
-  local sep = ' '
-  if
-    dir_path ~= ''
-    and ctx.config.layout
-    and ctx.config.layout.dir_position == 'right'
-  then
-    local content_w = icon_width + vim.fn.strdisplaywidth(filename) + 1 + vim.fn.strdisplaywidth(dir_path)
-    local pad = math.max(0, ctx.max_path_width - content_w)
-    if pad > 0 then sep = string.rep(' ', pad + 1) end
-  end
+  local right_align_dir = ctx.config.layout and ctx.config.layout.dir_position == 'right'
+  local inline_dir = right_align_dir and '' or dir_path
+  local sep = inline_dir == '' and '' or ' '
 
   -- Build line
-  local line = icon and string.format('%s %s%s%s%s', icon, filename, sep, dir_path, frecency)
-    or string.format('%s%s%s%s', filename, sep, dir_path, frecency)
+  local line = icon and string.format('%s %s%s%s%s', icon, filename, sep, inline_dir, frecency)
+    or string.format('%s%s%s%s', filename, sep, inline_dir, frecency)
 
   local padding = math.max(0, ctx.win_width - vim.fn.strdisplaywidth(line) + 5)
   table.insert(lines, line .. string.rep(' ', padding))
@@ -151,22 +144,28 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
   end
 
   -- 5. Directory path (dimmed)
+  local right_align_dir = ctx.config.layout and ctx.config.layout.dir_position == 'right'
   if #filename > 0 and #dir_path > 0 then
-    local prefix_len = #filename + 1 -- filename bytes + space
-    if icon then
-      prefix_len = prefix_len + #icon + 1 -- if icon add icon bytes + space
+    if right_align_dir then
+      local dir_width = vim.fn.strdisplaywidth(dir_path)
+      vim.api.nvim_buf_set_extmark(buf, ns_id, line_idx - 1, 0, {
+        virt_text = { { dir_path, ctx.config.hl.directory_path }, { ' ' } },
+        virt_text_win_col = math.max(0, ctx.max_path_width - dir_width - 1),
+        hl_mode = 'combine',
+      })
+    else
+      local prefix_len = #filename + 1 -- filename bytes + space
+      if icon then
+        prefix_len = prefix_len + #icon + 1 -- if icon add icon bytes + space
+      end
+      vim.api.nvim_buf_set_extmark(
+        buf,
+        ns_id,
+        line_idx - 1,
+        prefix_len,
+        { end_col = prefix_len + #dir_path, hl_group = ctx.config.hl.directory_path }
+      )
     end
-    if ctx.config.layout and ctx.config.layout.dir_position == 'right' then
-      local dir_start = line_content:find(dir_path, prefix_len, true)
-      if dir_start then prefix_len = dir_start - 1 end
-    end
-    vim.api.nvim_buf_set_extmark(
-      buf,
-      ns_id,
-      line_idx - 1,
-      prefix_len,
-      { end_col = prefix_len + #dir_path, hl_group = ctx.config.hl.directory_path }
-    )
   end
 
   -- 6. Current file
