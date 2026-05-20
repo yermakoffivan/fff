@@ -54,9 +54,20 @@ function M.render_line(item, ctx, item_idx) -- luacheck: ignore item_idx
   local available_width = math.max(ctx.max_path_width - icon_width, 40)
   local filename, dir_path = ctx.format_file_display(item, available_width)
 
+  local sep = ' '
+  if
+    dir_path ~= ''
+    and ctx.config.layout
+    and ctx.config.layout.dir_position == 'right'
+  then
+    local content_w = icon_width + vim.fn.strdisplaywidth(filename) + 1 + vim.fn.strdisplaywidth(dir_path)
+    local pad = math.max(0, ctx.max_path_width - content_w)
+    if pad > 0 then sep = string.rep(' ', pad + 1) end
+  end
+
   -- Build line
-  local line = icon and string.format('%s %s %s%s', icon, filename, dir_path, frecency)
-    or string.format('%s %s%s', filename, dir_path, frecency)
+  local line = icon and string.format('%s %s%s%s%s', icon, filename, sep, dir_path, frecency)
+    or string.format('%s%s%s%s', filename, sep, dir_path, frecency)
 
   local padding = math.max(0, ctx.win_width - vim.fn.strdisplaywidth(line) + 5)
   table.insert(lines, line .. string.rep(' ', padding))
@@ -144,6 +155,10 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
     local prefix_len = #filename + 1 -- filename bytes + space
     if icon then
       prefix_len = prefix_len + #icon + 1 -- if icon add icon bytes + space
+    end
+    if ctx.config.layout and ctx.config.layout.dir_position == 'right' then
+      local dir_start = line_content:find(dir_path, prefix_len, true)
+      if dir_start then prefix_len = dir_start - 1 end
     end
     vim.api.nvim_buf_set_extmark(
       buf,
