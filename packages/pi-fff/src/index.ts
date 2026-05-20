@@ -22,6 +22,8 @@ import type {
   MixedItem,
 } from "@ff-labs/fff-node";
 import { buildQuery } from "./query";
+import * as os from "os";
+import * as path from "path";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -301,15 +303,18 @@ export default function fffExtension(pi: ExtensionAPI) {
 
   const toolNames = resolveToolNames(currentMode);
 
-  // DB path resolution: flag > env > undefined (use fff-node defaults)
+  // Default storage under ~/.pi/agent/fff/ as documented in README
+  const defaultDbDir = path.join(os.homedir(), ".pi", "agent", "fff");
+
+  // DB path resolution: flag > env > default (~/.pi/agent/fff/)
   const frecencyDbPath =
     (pi.getFlag("fff-frecency-db") as string | undefined) ??
     process.env.FFF_FRECENCY_DB ??
-    undefined;
+    path.join(defaultDbDir, "frecency");
   const historyDbPath =
     (pi.getFlag("fff-history-db") as string | undefined) ??
     process.env.FFF_HISTORY_DB ??
-    undefined;
+    path.join(defaultDbDir, "history");
 
   function getMode(): FffMode {
     return currentMode;
