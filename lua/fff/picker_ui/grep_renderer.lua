@@ -256,7 +256,11 @@ end
 ---@param ctx table Render context
 ---@return string[]
 function M.render_line(item, ctx)
-  local is_new_group = (item.relative_path ~= ctx._grep_last_file)
+  -- First rendered item in this pass always gets header — fixes missing header
+  -- when paginating backward in multi-page grep results (ctx is fresh per render).
+  local is_first_visible = not ctx._grep_first_rendered
+  ctx._grep_first_rendered = true
+  local is_new_group = is_first_visible or (item.relative_path ~= ctx._grep_last_file)
   ctx._grep_last_file = item.relative_path
 
   local match_line = render_match_line(item, ctx)
