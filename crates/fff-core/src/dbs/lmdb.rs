@@ -157,6 +157,13 @@ pub(crate) trait LmdbStore: Sized + Send + Sync + 'static {
                 if Self::MAX_DBS > 0 {
                     opts.max_dbs(Self::MAX_DBS);
                 }
+                // LMDB default is 126 reader slots, shared across all processes
+                // using the same env. Each nvim instance + bg thread consumes
+                // slots, and slots leak when processes die uncleanly. Hitting
+                // MDB_READERS_FULL on read_txn surfaces as a crash through the
+                // FFI boundary (issue #498). Bump well above any realistic
+                // concurrent-nvim count.
+                opts.max_readers(1024);
                 opts.open(db_path)
             };
 
