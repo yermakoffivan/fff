@@ -444,6 +444,10 @@ pub struct FilePickerOptions {
     pub cache_budget: Option<ContentCacheBudget>,
     /// When `false`, `new_with_shared_state` skips the background file watcher.
     pub watch: bool,
+    /// Glob patterns to include during indexing. Empty = include all.
+    pub allowlist: Vec<String>,
+    /// Glob patterns to exclude during indexing. Applied after allowlist.
+    pub denylist: Vec<String>,
 }
 
 impl Default for FilePickerOptions {
@@ -455,6 +459,8 @@ impl Default for FilePickerOptions {
             mode: FFFMode::default(),
             cache_budget: None,
             watch: true,
+            allowlist: Vec::new(),
+            denylist: Vec::new(),
         }
     }
 }
@@ -471,6 +477,8 @@ pub struct FilePicker {
     enable_mmap_cache: bool,
     enable_content_indexing: bool,
     watch: bool,
+    allowlist: Vec<String>,
+    denylist: Vec<String>,
 }
 
 impl std::fmt::Debug for FilePicker {
@@ -526,6 +534,14 @@ impl FilePicker {
 
     pub fn mode(&self) -> FFFMode {
         self.mode
+    }
+
+    pub fn allowlist(&self) -> &[String] {
+        &self.allowlist
+    }
+
+    pub fn denylist(&self) -> &[String] {
+        &self.denylist
     }
 
     pub fn cache_budget(&self) -> &ContentCacheBudget {
@@ -717,6 +733,8 @@ impl FilePicker {
             enable_mmap_cache: options.enable_mmap_cache,
             enable_content_indexing: options.enable_content_indexing,
             watch: options.watch,
+            allowlist: options.allowlist,
+            denylist: options.denylist,
         })
     }
 
@@ -745,6 +763,8 @@ impl FilePicker {
         let signals = picker.scan_signals();
         let scanned_files_counter = picker.scanned_files_counter();
         let path = picker.base_path.clone();
+        let allowlist = picker.allowlist.clone();
+        let denylist = picker.denylist.clone();
 
         {
             let mut guard = shared_picker.write()?;
@@ -768,6 +788,8 @@ impl FilePicker {
                 auto_cache_budget: true,
                 install_watcher: true,
             },
+            allowlist,
+            denylist,
         )
         .spawn();
 
@@ -796,6 +818,8 @@ impl FilePicker {
             &self.scanned_files_count,
             &empty_frecency,
             self.mode,
+            &self.allowlist,
+            &self.denylist,
         )?;
 
         self.sync_data = sync;
@@ -1711,11 +1735,39 @@ impl FileSync {
         synced_files_count: &Arc<AtomicUsize>,
         shared_frecency: &SharedFrecency,
         mode: FFFMode,
+        allowlist: &[String],
+        denylist: &[String],
     ) -> Result<FileSync, Error> {
         use ignore::WalkBuilder;
+        use globset::{Glob, GlobSetBuilder};
 
         let scan_start = std::time::Instant::now();
         info!("SCAN: Starting filesystem walk and git status (async)");
+
+        // Build globsets for filtering
+        let allowlist_set = if !allowlist.is_empty() {
+            let mut builder = GlobSetBuilder::new();
+            for pattern in allowlist {
+                if let Ok(glob) = Glob::new(pattern) {
+                    builder.add(glob);
+                }
+            }
+            builder.build().ok()
+        } else {
+            None
+        };
+
+        let denylist_set = if !denylist.is_empty() {
+            let mut builder = GlobSetBuilder::new();
+            for pattern in denylist {
+                if let Ok(glob) = Glob::new(pattern) {
+                    builder.add(glob);
+                }
+            }
+            builder.build().ok()
+        } else {
+            None
+        };
 
         // Walk files (the fast part, typically 2-3s even on huge repos).
         let is_git_repo = git_workdir.is_some();
@@ -1749,6 +1801,8 @@ impl FileSync {
             let pairs = &pairs;
             let counter = Arc::clone(synced_files_count);
             let base_path = base_path.to_path_buf();
+            let allowlist_set = allowlist_set.clone();
+            let denylist_set = denylist_set.clone();
 
             Box::new(move |result| {
                 let Ok(entry) = result else {
@@ -1766,6 +1820,20 @@ impl FileSync {
 
                     if !is_git_repo && is_known_binary_extension(path) {
                         return ignore::WalkState::Continue;
+                    }
+
+                    // Apply allowlist/denylist filtering
+                    if let Ok(rel_path) = path.strip_prefix(&base_path) {
+                        if let Some(ref allow_set) = allowlist_set {
+                            if !allow_set.is_match(rel_path) {
+                                return ignore::WalkState::Continue;
+                            }
+                        }
+                        if let Some(ref deny_set) = denylist_set {
+                            if deny_set.is_match(rel_path) {
+                                return ignore::WalkState::Continue;
+                            }
+                        }
                     }
 
                     let metadata = entry.metadata().ok();

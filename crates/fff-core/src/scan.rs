@@ -57,6 +57,8 @@ pub(crate) struct ScanJob {
     /// side. Reset to 0 at scan start, incremented per-file by the
     /// walker. Shared `Arc` so the UI polls the same atomic.
     scanned_files_counter: Arc<AtomicUsize>,
+    allowlist: Vec<String>,
+    denylist: Vec<String>,
 }
 
 impl ScanJob {
@@ -80,6 +82,8 @@ impl ScanJob {
         let signals = picker.scan_signals();
         let scanned_files_counter = picker.scanned_files_counter();
         let base_path = picker.base_path().to_path_buf();
+        let allowlist = picker.allowlist().to_vec();
+        let denylist = picker.denylist().to_vec();
 
         let new_scan_config = ScanConfig {
             warmup: picker.has_mmap_cache(),
@@ -99,6 +103,8 @@ impl ScanJob {
             config: new_scan_config,
             shared_picker: shared_picker.clone(),
             shared_frecency: shared_frecency.clone(),
+            allowlist,
+            denylist,
         }))
     }
 
@@ -110,6 +116,8 @@ impl ScanJob {
         signals: ScanSignals,
         scanned_files_counter: Arc<AtomicUsize>,
         config: ScanConfig,
+        allowlist: Vec<String>,
+        denylist: Vec<String>,
     ) -> Self {
         Self {
             shared_picker,
@@ -119,6 +127,8 @@ impl ScanJob {
             signals,
             scanned_files_counter,
             config,
+            allowlist,
+            denylist,
         }
     }
 
@@ -140,6 +150,8 @@ impl ScanJob {
             signals,
             scanned_files_counter,
             config,
+            allowlist,
+            denylist,
         } = self;
 
         let _scanning = ScanningGuard::new(&signals, config.install_watcher);
@@ -157,6 +169,8 @@ impl ScanJob {
             &scanned_files_counter,
             &shared_frecency,
             mode,
+            &allowlist,
+            &denylist,
         ) {
             Ok(sync) => sync,
             Err(e) => {

@@ -270,6 +270,8 @@ pub unsafe extern "C" fn fff_create_instance2(
             watch,
             mode,
             cache_budget,
+            allowlist: Vec::new(),
+            denylist: Vec::new(),
         },
     ) {
         return FffResult::err(&format!("Failed to init file picker: {}", e));
@@ -924,6 +926,8 @@ pub unsafe extern "C" fn fff_restart_index(
             watch,
             mode,
             cache_budget: None,
+            allowlist: Vec::new(),
+            denylist: Vec::new(),
         },
     ) {
         Ok(()) => FffResult::ok_empty(),
