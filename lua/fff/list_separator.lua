@@ -6,10 +6,15 @@ local RIGHT_PADDING = 1
 -- overflow BOTH borders on left and right
 local OVERFLOW_TOTAL = 2
 
+---@class fff.list_separator.State
+---@field buf integer|nil
+---@field win integer|nil
+---@field ns_id integer
+---@field last string|nil
 local state = {
   buf = nil,
   win = nil,
-  ns_id = nil,
+  ns_id = 0,
   last = nil,
 }
 
@@ -22,12 +27,13 @@ local state = {
 
 function M.init(ns_id) state.ns_id = ns_id end
 
+---@return integer
 local function get_or_create_buf()
   if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then
     state.buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_set_option_value('bufhidden', 'wipe', { buf = state.buf })
   end
-  return state.buf
+  return state.buf --[[@as integer]]
 end
 
 --- @param total_width number Width of the float in cells (incl. `├` and `┤`)

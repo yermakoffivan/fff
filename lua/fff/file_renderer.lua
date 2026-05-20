@@ -18,9 +18,9 @@ local M = {}
 --- Render a file item line
 --- @param item FileItem File item from Rust
 --- @param ctx ListRenderContext Render context with all state
---- @param item_idx number Item index (1-based)
+--- @param _item_idx number Item index (1-based)
 --- @return string[] Array of line strings (always exactly 1)
-function M.render_line(item, ctx, item_idx)
+function M.render_line(item, ctx, _item_idx)
   local icons = require('fff.file_picker.icons')
   local lines = {}
 

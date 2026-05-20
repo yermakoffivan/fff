@@ -84,8 +84,10 @@ end
 --- snapshot tests (no debounce, fixed sizes).
 --- @param fixture fff.snapshot.Fixture
 function M.configure(fixture)
+  ---@diagnostic disable-next-line: missing-fields
   vim.g.fff = {
     frecency = { enabled = true, db_path = fixture.frecency_db },
+    ---@diagnostic disable-next-line: missing-fields
     history = { enabled = true, db_path = fixture.history_db },
   }
   -- Reload config so the new vim.g.fff is picked up.
