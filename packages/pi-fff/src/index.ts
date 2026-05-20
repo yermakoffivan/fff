@@ -450,13 +450,76 @@ export default function fffExtension(pi: ExtensionAPI) {
       setEditorComponent: (
         factory: ((tui: any, theme: any, keybindings: any) => any) | undefined,
       ) => void;
+      getEditorComponent?: () =>
+        | ((tui: any, theme: any, keybindings: any) => any)
+        | undefined;
     };
   }) {
     if (!shouldEnableMentions()) return;
 
-    ctx.ui.setEditorComponent(
-      (tui: any, theme: any, keybindings: any) => new FffEditor(tui, theme, keybindings),
-    );
+    // Compose with previous editor if available (Pi composability pattern)
+    const previousFactory = ctx.ui.getEditorComponent?.();
+
+    ctx.ui.setEditorComponent((tui: any, theme: any, keybindings: any) => {
+      // If previous editor exists, instantiate and wrap it
+      if (previousFactory) {
+        const baseEditor = previousFactory(tui, theme, keybindings);
+        const originalSetAutocomplete =
+          baseEditor.setAutocompleteProvider?.bind(baseEditor);
+
+        // Intercept setAutocompleteProvider to chain FFF autocomplete
+        baseEditor.setAutocompleteProvider = (provider: AutocompleteProvider) => {
+          const mentionProvider = createFffMentionProvider(getMentionItems);
+          const compositeProvider: AutocompleteProvider = {
+            getSuggestions: async (lines, cursorLine, cursorCol, options) => {
+              // Try @-mention first
+              const mentionResult = await mentionProvider.getSuggestions(
+                lines,
+                cursorLine,
+                cursorCol,
+                options,
+              );
+              if (mentionResult) return mentionResult;
+              // Fall back to base provider
+              return (
+                provider?.getSuggestions(lines, cursorLine, cursorCol, options) ?? null
+              );
+            },
+            applyCompletion: (lines, cursorLine, cursorCol, item, prefix) => {
+              // Let mention provider handle @ completions, base provider for others
+              if (prefix?.startsWith("@")) {
+                return mentionProvider.applyCompletion!(
+                  lines,
+                  cursorLine,
+                  cursorCol,
+                  item,
+                  prefix,
+                );
+              }
+              return (
+                provider?.applyCompletion?.(
+                  lines,
+                  cursorLine,
+                  cursorCol,
+                  item,
+                  prefix,
+                ) ?? {
+                  lines,
+                  cursorLine,
+                  cursorCol,
+                }
+              );
+            },
+          };
+          originalSetAutocomplete?.(compositeProvider);
+        };
+
+        return baseEditor;
+      }
+
+      // No previous editor - use standalone FffEditor
+      return new FffEditor(tui, theme, keybindings);
+    });
   }
 
   // --- Flags / lifecycle ---
