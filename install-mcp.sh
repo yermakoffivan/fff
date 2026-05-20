@@ -88,7 +88,14 @@ get_latest_release_tag() {
     fi
 
     local releases_json
-    releases_json=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases") \
+    local curl_args=(-fsSL)
+
+    # Use GitHub token if available to avoid rate limiting
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        curl_args+=(-H "Authorization: token $GITHUB_TOKEN")
+    fi
+
+    releases_json=$(curl "${curl_args[@]}" "https://api.github.com/repos/${REPO}/releases") \
         || error "Failed to fetch releases from https://github.com/${REPO}/releases"
 
     # Find the first release that contains an fff-mcp binary for our platform
