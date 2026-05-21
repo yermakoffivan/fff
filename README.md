@@ -244,6 +244,14 @@ require('fff').setup({
     focus_list = '<leader>l',
     focus_preview = '<leader>p',
   },
+  -- Telescope-style user mappings on the input buffer, keyed by mode (`i` / `n`).
+  -- Values may be a function or a string (rhs). Applied on top of built-in keymaps.
+  mappings = {
+    i = {
+      -- ["<A-BS>"] = function() vim.api.nvim_input("<C-w>") end,
+    },
+    n = {},
+  },
   frecency = {
     enabled = true,
     db_path = vim.fn.stdpath('cache') .. '/fff_nvim',

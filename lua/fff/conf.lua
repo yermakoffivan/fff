@@ -69,6 +69,7 @@ local M = {}
 --- @field layout FffLayoutConfig
 --- @field preview FffPreviewConfig
 --- @field keymaps FffKeymapsConfig
+--- @field mappings table<string, table<string, function|string>> User-defined per-mode keymaps. Telescope-style: { i = { ["<A-BS>"] = fn }, n = { ... } }. Mapped on the input buffer.
 --- @field hl table<string, string>
 --- @field frecency FffFrecencyConfig
 --- @field history FffHistoryConfig
@@ -261,6 +262,16 @@ local function init()
       -- this are specific for the normal mode (you can exit it using any other keybind like jj)
       focus_list = '<leader>l',
       focus_preview = '<leader>p',
+    },
+    -- Telescope-style user mappings keyed by mode. Mapped on the input buffer.
+    -- Example:
+    --   mappings = {
+    --     i = { ["<A-BS>"] = function() vim.api.nvim_input("<C-w>") end },
+    --     n = { ["<C-r>"] = function() ... end },
+    --   }
+    mappings = {
+      i = {},
+      n = {},
     },
     hl = {
       border = 'FloatBorder',

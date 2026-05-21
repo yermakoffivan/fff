@@ -1195,6 +1195,13 @@ function M.setup_keymaps()
   set_keymap({ 'i', 'n' }, keymaps.send_to_quickfix, M.send_to_quickfix, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.cycle_grep_modes, M.cycle_grep_modes, input_opts)
 
+  local user_mappings = M.state.config.mappings or {}
+  for _, mode in ipairs({ 'i', 'n' }) do
+    for lhs, rhs in pairs(user_mappings[mode] or {}) do
+      if type(rhs) == 'function' or type(rhs) == 'string' then vim.keymap.set(mode, lhs, rhs, input_opts) end
+    end
+  end
+
   -- List buffer
   set_keymap('n', keymaps.close, M.close, list_opts)
   set_keymap('n', 'q', M.close, list_opts)
