@@ -47,6 +47,10 @@ local function render_match_line(item, ctx)
   -- vim.json.decode may return Blobs for strings with NUL bytes; coerce to string.
   local raw_content = item.line_content
   if type(raw_content) ~= 'string' then raw_content = raw_content and tostring(raw_content) or '' end
+  -- Lua strings with embedded NUL get marshalled to Vim Blobs by vim.fn.*, causing
+  -- E976 in strdisplaywidth. Replace NULs so binary-leaning files (e.g. .hdr textures)
+  -- that slip past binary detection don't crash live grep rendering.
+  if raw_content:find('%z') then raw_content = (raw_content:gsub('%z', ' ')) end
   local content = raw_content
 
   -- Indent + location + separator + content
