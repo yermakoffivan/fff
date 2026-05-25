@@ -473,6 +473,12 @@ function M.setup_keymaps()
   set_keymap({ 'i', 'n' }, keymaps.toggle_select, M.toggle_select, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.send_to_quickfix, M.send_to_quickfix, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.cycle_grep_modes, M.cycle_grep_modes, input_opts)
+  if keymaps.grep_jump_to_next_file then
+    set_keymap({ 'i', 'n' }, keymaps.grep_jump_to_next_file, M.grep_jump_to_next_file, input_opts)
+  end
+  if keymaps.grep_jump_to_prev_file then
+    set_keymap({ 'i', 'n' }, keymaps.grep_jump_to_prev_file, M.grep_jump_to_prev_file, input_opts)
+  end
 
   -- List buffer
   set_keymap('n', keymaps.close, M.close, list_opts)
@@ -581,6 +587,94 @@ end
 --- Cycle through grep search modes based on configured modes list.
 --- Only works when the picker is in grep mode. Triggers a re-search
 --- with the current query using the new mode.
+--- Jump cursor to first item of the next file group in grep mode.
+--- Loads next page when current page ends without a new file group.
+function M.grep_jump_to_next_file()
+  if not M.state.active or M.state.mode ~= 'grep' then return end
+  local items = M.state.filtered_items
+  if not items or #items == 0 then return end
+
+  local current_path = items[M.state.cursor] and items[M.state.cursor].relative_path
+  for i = M.state.cursor + 1, #items do
+    if items[i].relative_path ~= current_path then
+      M.state.cursor = i
+      M.render_list()
+      M.update_preview_smart()
+      M.update_status()
+      return
+    end
+  end
+
+  if M.load_next_page() then
+    local new_items = M.state.filtered_items
+    if new_items and #new_items > 0 then
+      local idx = 1
+      if new_items[1].relative_path == current_path then
+        for i = 2, #new_items do
+          if new_items[i].relative_path ~= current_path then
+            idx = i
+            break
+          end
+        end
+      end
+      M.state.cursor = idx
+      M.render_list()
+      M.update_preview_smart()
+      M.update_status()
+    end
+  end
+end
+
+--- Jump cursor to first item of the previous file group in grep mode.
+--- Loads previous page when current page starts without an earlier group.
+function M.grep_jump_to_prev_file()
+  if not M.state.active or M.state.mode ~= 'grep' then return end
+  local items = M.state.filtered_items
+  if not items or #items == 0 then return end
+
+  local current_path = items[M.state.cursor] and items[M.state.cursor].relative_path
+
+  local prev_path = nil
+  for i = M.state.cursor - 1, 1, -1 do
+    if items[i].relative_path ~= current_path then
+      prev_path = items[i].relative_path
+      break
+    end
+  end
+  if prev_path then
+    local first = 1
+    for i = 1, #items do
+      if items[i].relative_path == prev_path then
+        first = i
+        break
+      end
+    end
+    M.state.cursor = first
+    M.render_list()
+    M.update_preview_smart()
+    M.update_status()
+    return
+  end
+
+  if M.load_previous_page() then
+    local new_items = M.state.filtered_items
+    if new_items and #new_items > 0 then
+      local last_path = new_items[#new_items].relative_path
+      local first = #new_items
+      for i = 1, #new_items do
+        if new_items[i].relative_path == last_path then
+          first = i
+          break
+        end
+      end
+      M.state.cursor = first
+      M.render_list()
+      M.update_preview_smart()
+      M.update_status()
+    end
+  end
+end
+
 function M.cycle_grep_modes()
   if not M.state.active or M.state.mode ~= 'grep' then return end
 
