@@ -645,7 +645,7 @@ impl FileItem {
     pub(crate) fn get_content_for_search<'a>(
         &'a self,
         buf: &'a mut Vec<u8>,
-        mmap_slot: &'a mut MmapSlot,
+        #[cfg_attr(target_os = "windows", allow(unused_variables))] mmap_slot: &'a mut MmapSlot,
         arena: ArenaPtr,
         base_path: &Path,
         budget: &ContentCacheBudget,
