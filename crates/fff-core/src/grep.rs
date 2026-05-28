@@ -1644,7 +1644,13 @@ fn fuzzy_grep_search<'a>(
         .par_iter()
         .enumerate()
         .map_init(
-            || (matcher.clone(), Vec::with_capacity(64 * 1024), MmapSlot::default()),
+            || {
+                (
+                    matcher.clone(),
+                    Vec::with_capacity(64 * 1024),
+                    MmapSlot::default(),
+                )
+            },
             |(matcher, buf, mmap_slot), (idx, file)| {
                 if abort_signal.load(Ordering::Relaxed) {
                     budget_exceeded.store(true, Ordering::Relaxed);
@@ -1663,7 +1669,8 @@ fn fuzzy_grep_search<'a>(
                 } else {
                     arena
                 };
-                let file_bytes = file.get_content_for_search(buf, mmap_slot, file_arena, base_path, budget)?;
+                let file_bytes =
+                    file.get_content_for_search(buf, mmap_slot, file_arena, base_path, budget)?;
 
                 // File-level prefilter: check if enough distinct needle chars
                 // exist anywhere in the file bytes.  Uses memchr for speed.

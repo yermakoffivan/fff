@@ -598,6 +598,7 @@ impl FileItem {
     /// Returns a reference to a cached mmap of the file's contents.
     ///
     /// SAFETY-CRITICAL: callers must hold the picker read lock for as long as the returned slice is in use.
+    #[cfg(not(target_os = "windows"))]
     pub(crate) fn get_cached_content(
         &self,
         arena: ArenaPtr,
@@ -690,7 +691,7 @@ const MMAP_THRESHOLD: u64 = 16 * 1024;
 #[cfg(all(not(target_os = "windows"), not(target_arch = "aarch64")))]
 const MMAP_THRESHOLD: u64 = 4 * 1024;
 
-// these are imperically set values for the benchmarks. Theory is simple:
+// these are empirically set values for the benchmarks. Theory is simple:
 // the larger the file is - the more syscalls needed to read the file, so at some
 // point it becomes better strategy to mmap file and process instead of doing chunking
 #[cfg(target_os = "linux")]
