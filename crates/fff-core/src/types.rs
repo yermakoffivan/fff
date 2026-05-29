@@ -697,6 +697,7 @@ const MMAP_THRESHOLD: u64 = 4 * 1024;
 #[cfg(target_os = "macos")]
 pub(crate) const FRESH_MMAP_THRESHOLD: u64 = 1024 * 1024;
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 pub(crate) const FRESH_MMAP_THRESHOLD: u64 = 0;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(crate) const FRESH_MMAP_THRESHOLD: u64 = 256 * 1024;
