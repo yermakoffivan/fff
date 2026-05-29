@@ -694,10 +694,12 @@ const MMAP_THRESHOLD: u64 = 4 * 1024;
 // these are empirically set values for the benchmarks. Theory is simple:
 // the larger the file is - the more syscalls needed to read the file, so at some
 // point it becomes better strategy to mmap file and process instead of doing chunking
-#[cfg(target_os = "linux")]
-pub(crate) const FRESH_MMAP_THRESHOLD: u64 = 256 * 1024;
-#[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
 pub(crate) const FRESH_MMAP_THRESHOLD: u64 = 1024 * 1024;
+#[cfg(target_os = "windows")]
+pub(crate) const FRESH_MMAP_THRESHOLD: u64 = 0;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) const FRESH_MMAP_THRESHOLD: u64 = 256 * 1024;
 
 /// Per-thread scratch slot owning a transient mmap returned from
 /// [`FileItem::get_content_for_search`]. `Option<Mmap>` on Unix,
