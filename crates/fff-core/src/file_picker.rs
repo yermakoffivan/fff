@@ -1192,12 +1192,9 @@ impl FilePicker {
         pattern: &'p str,
         options: FuzzySearchOptions<'p>,
     ) -> SearchResult<'p> {
-        let mut constraints = fff_query_parser::ConstraintVec::new();
-        constraints.push(fff_query_parser::Constraint::Glob(pattern));
-
         let query = FFFQuery {
             raw_query: pattern,
-            constraints,
+            constraints: vec![fff_query_parser::Constraint::Glob(pattern)],
             fuzzy_query: fff_query_parser::FuzzyQuery::Empty,
             location: None,
         };

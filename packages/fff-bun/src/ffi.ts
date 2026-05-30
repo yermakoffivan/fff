@@ -349,13 +349,7 @@ const RES_ERROR = 8; // *mut c_char (8)
 const RES_HANDLE = 16; // *mut c_void (8)
 const RES_INT_VALUE = 24; // i64         (8)
 
-// ---------------------------------------------------------------------------
-// FffCreateOptions wire layout (88 bytes, 64-bit only).
-// MUST match `crates/fff-c/src/ffi_types.rs::FffCreateOptions`. The Rust unit
-// test `options_layout_tests::fff_create_options_layout_is_stable_64bit`
-// locks these offsets in — bump FFF_CREATE_OPTIONS_VERSION when adding new
-// fields and append-only.
-// ---------------------------------------------------------------------------
+// MUST match `crates/fff-c/src/ffi_types.rs::FffCreateOptions`
 const FFF_CREATE_OPTIONS_VERSION = 1;
 const FFF_CREATE_OPTIONS_SIZE = 88;
 const FCO_VERSION = 0;
@@ -374,10 +368,6 @@ const FCO_CACHE_BUDGET_MAX_FILE_SIZE = 72;
 const FCO_ENABLE_FS_ROOT_SCANNING = 80;
 const FCO_ENABLE_HOME_DIR_SCANNING = 81;
 
-/**
- * Read the FffResult envelope: check success, extract payload, free envelope.
- * On error returns a Result<never>. On success returns the raw handle pointer and int_value.
- */
 function readResultEnvelope(
   resultPtr: Pointer | null,
 ): { success: true; handlePtr: number; intValue: number } | Result<never> {
@@ -525,10 +515,9 @@ export function ffiCreate(
   }
 
   const success = read.u8(resultPtr, RES_SUCCESS) !== 0;
-  const errorPtr = read.ptr(resultPtr, RES_ERROR);
-  const handlePtr = read.ptr(resultPtr, RES_HANDLE);
 
   if (success) {
+    const handlePtr = read.ptr(resultPtr, RES_HANDLE);
     const handle = handlePtr as unknown as Pointer;
     library.symbols.fff_free_result(resultPtr);
 
@@ -538,6 +527,7 @@ export function ffiCreate(
 
     return { ok: true, value: handle };
   } else {
+    const errorPtr = read.ptr(resultPtr, RES_ERROR);
     const errorMsg = readCString(errorPtr) || "Unknown error";
     library.symbols.fff_free_result(resultPtr);
     return err(errorMsg);

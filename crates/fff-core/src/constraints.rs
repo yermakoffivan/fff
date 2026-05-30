@@ -174,7 +174,7 @@ pub(crate) fn apply_constraints<'a, T: Constrainable + Sync>(
 #[cfg(feature = "zlob")]
 type GlobPattern = zlob::ZlobPattern;
 #[cfg(not(feature = "zlob"))]
-type CompiledGlob = globset::GlobMatcher;
+type GlobPattern = globset::GlobMatcher;
 
 /// How `Constraint::Glob` is evaluated for each item.
 enum GlobStrategy {
@@ -190,7 +190,7 @@ enum GlobStrategy {
 }
 
 /// Bundles preprocessed constraints for the per-item evaluator.
-struct ConstraintPlan<'q, 'c> {
+pub(crate) struct ConstraintPlan<'q, 'c> {
     /// OR semantics — file passes if ANY extension matches. Empty = no ext filter.
     extensions: SmallVec<[&'q str; 8]>,
     /// AND semantics — file passes only if ALL match.
@@ -198,14 +198,13 @@ struct ConstraintPlan<'q, 'c> {
     glob: GlobStrategy,
 }
 
-/// Per-iteration scratch buffers so we don't reallocate per item.
-struct Scratch {
+pub(crate) struct ConstraintsBuffers {
     fname: String,
     path: String,
 }
 
-impl Scratch {
-    fn new() -> Self {
+impl ConstraintsBuffers {
+    pub(crate) fn new() -> Self {
         Self {
             fname: String::with_capacity(64),
             path: String::with_capacity(64),
@@ -214,7 +213,7 @@ impl Scratch {
 }
 
 impl<'q, 'c> ConstraintPlan<'q, 'c> {
-    fn build<T: Constrainable>(
+    pub(crate) fn build<T: Constrainable>(
         constraints: &'c [Constraint<'q>],
         items: &[T],
         arena: ArenaPtr,
@@ -227,7 +226,7 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
                 _ => rest.push(c),
             }
         }
-        let has_pre_filter = !extensions.is_empty() || rest.iter().any(|c| !is_glob_node(*c));
+        let has_pre_filter = !extensions.is_empty() || rest.iter().any(|&c| !is_glob_node(c));
         let glob = build_glob_strategy(&rest, has_pre_filter, items, arena);
         Self {
             extensions,
@@ -242,13 +241,13 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
             items
                 .par_iter()
                 .enumerate()
-                .map_init(Scratch::new, |scratch, (i, item)| {
+                .map_init(ConstraintsBuffers::new, |scratch, (i, item)| {
                     self.matches(item, i, arena, scratch).then_some(item)
                 })
                 .flatten()
                 .collect()
         } else {
-            let mut scratch = Scratch::new();
+            let mut scratch = ConstraintsBuffers::new();
             items
                 .iter()
                 .enumerate()
@@ -258,16 +257,17 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
     }
 
     #[inline]
-    fn matches<T: Constrainable>(
+    pub(crate) fn matches<T: Constrainable>(
         &self,
         item: &T,
         index: usize,
         arena: ArenaPtr,
-        scratch: &mut Scratch,
+        scratch: &mut ConstraintsBuffers,
     ) -> bool {
         if !self.passes_extensions(item, arena, scratch) {
             return false;
         }
+
         let mut glob_idx = 0;
         self.rest.iter().all(|c| {
             let glob: &GlobStrategy = &self.glob;
@@ -328,7 +328,7 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
         &self,
         item: &T,
         arena: ArenaPtr,
-        scratch: &mut Scratch,
+        scratch: &mut ConstraintsBuffers,
     ) -> bool {
         if self.extensions.is_empty() {
             return true;
@@ -350,7 +350,7 @@ fn evaluate<T: Constrainable>(
     glob_idx: &mut usize,
     negate: bool,
     arena: ArenaPtr,
-    scratch: &mut Scratch,
+    scratch: &mut ConstraintsBuffers,
 ) -> bool {
     let raw = match constraint {
         Constraint::Glob(_) => {

@@ -62,17 +62,6 @@ import { createGrepCursor, err } from "./types.js";
 
 const LIBRARY_KEY = "fff_c";
 
-/**
- * `FffCreateOptions` shape for ffi-rs's `paramsType: [structDef]` channel.
- * Field order MUST match `crates/fff-c/src/ffi_types.rs::FffCreateOptions`
- * so ffi-rs's struct-by-value marshalling produces the right layout. New
- * fields go at the END — appending only.
- *
- * `DataType.String` makes ffi-rs allocate a CString per call and write its
- * pointer into the struct (no manual buffer/address dance). `DataType.U8`
- * is used for booleans because ffi-rs's struct serializer needs a 1-byte
- * field to keep alignment in sync with Rust's `bool`.
- */
 const FFF_CREATE_OPTIONS_STRUCT = {
   version: DataType.U32,
   base_path: DataType.String,
@@ -90,6 +79,8 @@ const FFF_CREATE_OPTIONS_STRUCT = {
   enable_fs_root_scanning: DataType.U8,
   enable_home_dir_scanning: DataType.U8,
 };
+
+// ALWAYS KEEP IN SYNC WITH fff.h
 const FFF_CREATE_OPTIONS_VERSION = 1;
 
 /** Grep mode constants matching the C API (u8). */
@@ -246,7 +237,11 @@ function readResultEnvelope(
   paramsValue: unknown[],
 ): { rawPtr: JsExternal; struct: FffResultRaw } | Result<never> {
   loadLibrary();
-  const { rawPtr, struct: structData } = callRaw(funcName, paramsType, paramsValue);
+  const { rawPtr, struct: structData } = callRaw(
+    funcName,
+    paramsType,
+    paramsValue,
+  );
 
   if (structData.success === 0) {
     const errorStr = readCString(structData.error);
@@ -324,7 +319,8 @@ function callJsonResult<T>(
   if (isNullPointer(handlePtr)) return { ok: true, value: undefined as T };
   const jsonStr = readCString(handlePtr);
   freeString(handlePtr);
-  if (jsonStr === null || jsonStr === "") return { ok: true, value: undefined as T };
+  if (jsonStr === null || jsonStr === "")
+    return { ok: true, value: undefined as T };
   try {
     return { ok: true, value: snakeToCamel(JSON.parse(jsonStr)) as T };
   } catch {
@@ -352,19 +348,6 @@ function freeString(ptr: JsExternal): void {
  */
 export type NativeHandle = JsExternal;
 
-/**
- * Create a new file finder instance.
- *
- * Uses ffi-rs's native struct support: we describe `FffCreateOptions` as a
- * `paramsType` and pass a JS object as the `paramsValue`. ffi-rs handles
- * `DataType.String` field marshalling (allocates the cstring, writes its
- * pointer into the struct, frees after the call) — no buffer-address dance,
- * no round-trips, and adding new options later means just one new line in
- * `FFF_CREATE_OPTIONS_STRUCT` plus the matching field in the JS object.
- *
- * Calls `fff_create_instance_with_value` (the by-value calling-convention
- * adapter for `fff_create_instance_with`).
- */
 export function ffiCreate(
   basePath: string,
   frecencyDbPath: string,
@@ -404,7 +387,7 @@ export function ffiCreate(
 
   const rawPtr = load({
     library: LIBRARY_KEY,
-    funcName: "fff_create_instance_with_value",
+    funcName: "fff_create_instance_with",
     retType: DataType.External,
     paramsType: [FFF_CREATE_OPTIONS_STRUCT],
     paramsValue: [optsValue],
@@ -422,7 +405,7 @@ export function ffiCreate(
     if (success) {
       const handle = structData.handle;
       if (isNullPointer(handle)) {
-        return err("fff_create_instance_with_value returned null handle");
+        return err("fff_create_instance_with returned null handle");
       }
       return { ok: true, value: handle };
     } else {
@@ -856,10 +839,16 @@ function readGrepMatchFromRaw(raw: FffGrepMatchRaw): GrepMatch {
     match.fuzzyScore = raw.fuzzy_score;
   }
   if (raw.context_before_count > 0) {
-    match.contextBefore = readCStringArray(raw.context_before, raw.context_before_count);
+    match.contextBefore = readCStringArray(
+      raw.context_before,
+      raw.context_before_count,
+    );
   }
   if (raw.context_after_count > 0) {
-    match.contextAfter = readCStringArray(raw.context_after, raw.context_after_count);
+    match.contextAfter = readCStringArray(
+      raw.context_after,
+      raw.context_after_count,
+    );
   }
   if (raw.is_definition !== 0) {
     match.isDefinition = true;
@@ -928,7 +917,8 @@ function parseGrepResult(rawPtr: JsExternal): Result<GrepResult> {
     totalFilesSearched: gr.total_files_searched,
     totalFiles: gr.total_files,
     filteredFileCount: gr.filtered_file_count,
-    nextCursor: gr.next_file_offset > 0 ? createGrepCursor(gr.next_file_offset) : null,
+    nextCursor:
+      gr.next_file_offset > 0 ? createGrepCursor(gr.next_file_offset) : null,
   };
   if (regexFallbackError) {
     grepResult.regexFallbackError = regexFallbackError;
@@ -977,7 +967,11 @@ function parseSearchResult(rawPtr: JsExternal): Result<SearchResult> {
   if (sr.location_tag === 1) {
     location = { type: "line", line: sr.location_line };
   } else if (sr.location_tag === 2) {
-    location = { type: "position", line: sr.location_line, col: sr.location_col };
+    location = {
+      type: "position",
+      line: sr.location_line,
+      col: sr.location_col,
+    };
   } else if (sr.location_tag === 3) {
     location = {
       type: "range",
@@ -1148,7 +1142,11 @@ function parseMixedSearchResult(rawPtr: JsExternal): Result<MixedSearchResult> {
   if (sr.location_tag === 1) {
     location = { type: "line", line: sr.location_line };
   } else if (sr.location_tag === 2) {
-    location = { type: "position", line: sr.location_line, col: sr.location_col };
+    location = {
+      type: "position",
+      line: sr.location_line,
+      col: sr.location_col,
+    };
   } else if (sr.location_tag === 3) {
     location = {
       type: "range",
@@ -1272,7 +1270,14 @@ export function ffiGlob(
       DataType.U32, // page_index
       DataType.U32, // page_size
     ],
-    paramsValue: [handle, pattern, currentFile, maxThreads, pageIndex, pageSize],
+    paramsValue: [
+      handle,
+      pattern,
+      currentFile,
+      maxThreads,
+      pageIndex,
+      pageSize,
+    ],
     freeResultMemory: false,
   }) as JsExternal;
 
@@ -1304,7 +1309,14 @@ export function ffiSearchDirectories(
       DataType.U32, // page_index
       DataType.U32, // page_size
     ],
-    paramsValue: [handle, query, currentFile ?? "", maxThreads, pageIndex, pageSize],
+    paramsValue: [
+      handle,
+      query,
+      currentFile ?? "",
+      maxThreads,
+      pageIndex,
+      pageSize,
+    ],
     freeResultMemory: false,
   }) as JsExternal;
 
@@ -1516,7 +1528,11 @@ export function ffiGetScanProgress(
   handle: NativeHandle,
 ): Result<{ scannedFilesCount: number; isScanning: boolean }> {
   loadLibrary();
-  const res = readResultEnvelope("fff_get_scan_progress", [DataType.External], [handle]);
+  const res = readResultEnvelope(
+    "fff_get_scan_progress",
+    [DataType.External],
+    [handle],
+  );
   if ("ok" in res) return res;
 
   const handlePtr = res.struct.handle;
@@ -1549,7 +1565,10 @@ export function ffiGetScanProgress(
 /**
  * Wait for a tree scan to complete.
  */
-export function ffiWaitForScan(handle: NativeHandle, timeoutMs: number): Result<boolean> {
+export function ffiWaitForScan(
+  handle: NativeHandle,
+  timeoutMs: number,
+): Result<boolean> {
   return callBoolResult(
     "fff_wait_for_scan",
     [DataType.External, DataType.U64],
@@ -1560,7 +1579,10 @@ export function ffiWaitForScan(handle: NativeHandle, timeoutMs: number): Result<
 /**
  * Restart index in new path.
  */
-export function ffiRestartIndex(handle: NativeHandle, newPath: string): Result<void> {
+export function ffiRestartIndex(
+  handle: NativeHandle,
+  newPath: string,
+): Result<void> {
   return callVoidResult(
     "fff_restart_index",
     [DataType.External, DataType.String],

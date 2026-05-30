@@ -104,7 +104,7 @@ console.log(`fff init+scan: ${fffInit.ms.toFixed(2)}ms\n`);
 const fffSamples: Sample[] = [];
 for (let i = 0; i < iterations; i++) {
   const r = await bench(() => {
-    const out = finder.glob(pattern, { pageSize: 100_000,  });
+    const out = finder.glob(pattern, { pageSize: 100 });
     if (!out.ok) throw new Error(out.error);
     return out.value;
   });
