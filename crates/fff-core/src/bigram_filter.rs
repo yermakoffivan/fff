@@ -593,6 +593,14 @@ impl BigramOverlay {
 }
 
 pub(crate) const MAX_INDEXABLE_FILE_SIZE: usize = 2 * 1024 * 1024;
+
+/// Upper bound for the binary-detection prefix read on non-indexable files.
+/// Files larger than `MAX_INDEXABLE_FILE_SIZE` skip the bigram pass, but we
+/// still want them flagged as binary so grep / preview don't ship NUL-bearing
+/// content to the Lua renderer (which raises `E976: Using a Blob as a String`
+/// in `vim.fn.strdisplaywidth`). 2 MB matches the indexable cap and keeps the
+/// added I/O bounded.
+pub(crate) const BINARY_DETECTION_PREFIX: usize = MAX_INDEXABLE_FILE_SIZE;
 const BIGRAM_CHUNK_FILES: usize = 4 * 64;
 
 /// Sparse-column cutoff for the skip-1 sub-index. Rare skip columns add
@@ -704,6 +712,72 @@ pub(crate) fn build_bigram_index(
     crate::file_picker::hint_allocator_collect();
 
     index
+}
+
+/// Read the first `BINARY_DETECTION_PREFIX` bytes of every non-indexable
+/// file and flip `set_binary(true)` when a NUL byte is found. Files larger
+/// than `MAX_INDEXABLE_FILE_SIZE` skip the bigram pass entirely, so without
+/// this step a binary file in the `(2 MB, grep_max_file_size]` window keeps
+/// `is_binary == false` and reaches the grep path. The Lua renderer then
+/// hits `E976: Using a Blob as a String` (issue #546).
+///
+/// Bounded by an explicit `max_file_size` (the active grep cap) so we never
+/// open files we wouldn't grep anyway. Files already flagged binary
+/// (extension match) or with `size <= MAX_INDEXABLE_FILE_SIZE` (covered by
+/// the bigram pass) are skipped.
+#[tracing::instrument(skip_all, name = "Classifying Binary (non-indexable)", level = tracing::Level::DEBUG)]
+pub(crate) fn classify_non_indexable_binary(
+    files: &[crate::types::FileItem],
+    base_path: &std::path::Path,
+    arena: crate::simd_path::ArenaPtr,
+    max_file_size: u64,
+) {
+    if files.is_empty() {
+        return;
+    }
+
+    #[cfg(unix)]
+    let base_fd: libc::c_int = open_base_dir_fd(base_path);
+    #[cfg(not(unix))]
+    let base_fd: i32 = -1;
+
+    crate::file_picker::BACKGROUND_THREAD_POOL.install(|| {
+        files.par_chunks(BIGRAM_CHUNK_FILES).for_each(|chunk| {
+            for file in chunk {
+                if file.is_binary()
+                    || file.size == 0
+                    || file.size <= MAX_INDEXABLE_FILE_SIZE as u64
+                    || file.size > max_file_size
+                {
+                    continue;
+                }
+
+                READ_BUF.with(|read_cell| {
+                    let mut buf = read_cell.borrow_mut();
+                    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                    let want = (file.size as usize).min(BINARY_DETECTION_PREFIX);
+                    let filled = file.read_trimmed_into_buf(
+                        base_fd,
+                        base_path,
+                        arena,
+                        &mut path_buf,
+                        &mut buf[..want],
+                    );
+                    if filled == 0 {
+                        return;
+                    }
+                    if crate::file_picker::detect_binary_content(&buf[..filled]) {
+                        file.set_binary(true);
+                    }
+                });
+            }
+        });
+    });
+
+    #[cfg(unix)]
+    if base_fd >= 0 {
+        unsafe { libc::close(base_fd) };
+    }
 }
 
 /// Open the base directory for the `openat` fast path. Returns `-1` on

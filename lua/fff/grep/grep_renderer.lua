@@ -49,6 +49,12 @@ local function render_match_line(item, ctx)
   if type(raw_content) ~= 'string' then raw_content = raw_content and tostring(raw_content) or '' end
   local content = raw_content
 
+  -- Last-resort guard for binary content that slipped past Rust-side detection.
+  -- vim.fn.strdisplaywidth crashes with `E976: Using a Blob as a String` on
+  -- strings containing embedded NULs. Show the line as a binary placeholder
+  -- instead of replacing the bytes (#546).
+  if content:find('\0', 1, true) then content = '<binary content>' end
+
   -- Indent + location + separator + content
   local indent = ' '
   local prefix_display_w = #indent + #location + #separator
