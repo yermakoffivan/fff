@@ -483,9 +483,36 @@ function M.select(action)
   vim.cmd('stopinsert')
   M.close()
 
+  local on_submit = config and config.on_submit
+
   -- Defer file open past picker float teardown. Without this, foldexpr is not
   -- recomputed on the new window (folds appear missing) on some platforms.
   vim.schedule(function()
+    if type(on_submit) == 'function' then
+      local ok, err = pcall(on_submit, item, {
+        action = action,
+        path = abs_path,
+        relative_path = relative_path,
+        location = location,
+        query = query,
+        mode = mode,
+      })
+      if not ok then vim.notify('FFF: on_submit error: ' .. tostring(err), vim.log.levels.ERROR) end
+
+      if query and query ~= '' then
+        local cfg = config or conf.get()
+        if cfg.history and cfg.history.enabled then
+          local fff = require('fff.core').ensure_initialized()
+          if mode == 'grep' then
+            pcall(fff.track_grep_query, query)
+          else
+            pcall(fff.track_query_completion, query, item.relative_path)
+          end
+        end
+      end
+      return
+    end
+
     if config and config.select and type(config.select.select_window) == 'function' then
       local ok, win = pcall(config.select.select_window, vim.api.nvim_get_current_buf(), action)
       if not ok then
