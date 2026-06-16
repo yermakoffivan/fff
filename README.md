@@ -664,6 +664,46 @@ Source: [`crates/fff-c/`](./crates/fff-c/).
 
 Stable C ABI. Bind from C/C++, Zig, Go via cgo, Python via ctypes, or anything with C FFI.
 
+<details id="python-bindings">
+<summary>
+<h2>Python bindings</h2>
+</summary>
+
+### Install
+
+```bash
+pip install fff-python
+```
+
+Or build and install from source:
+
+```bash
+cd packages/fff-python
+uv sync --all-extras
+uv run maturin develop --release
+```
+
+### Basic usage
+
+```python
+from fff import FileFinder
+
+with FileFinder("/path/to/project", watch=False) as finder:
+    finder.wait_for_scan(timeout_ms=5000)
+
+    result = finder.search("main")
+    for item, score in zip(result.items, result.scores):
+        print(f"{item.relative_path}: {score.total}")
+
+    hits = finder.grep("class Profile", mode="plain", before_context=1, after_context=1)
+```
+
+Source: [`packages/fff-python/`](./packages/fff-python/).
+
+</details>
+
+Native Python bindings built with PyO3. Use them for notebooks, agent scripts, or any Python tool that needs fast file search.
+
 ---
 
 ## What is FFF and why use it over ripgrep or fzf?

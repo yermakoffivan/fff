@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_pypi:
-        description: "Publish Python wheels to PyPI (tag pushes only)"
+        description: "Manually build and publish Python wheels to PyPI"
         required: false
         default: false
         type: boolean
@@ -615,7 +615,7 @@ jobs:
 
   pypi-publish:
     name: Publish Python wheels to PyPI
-    needs: [release]
+    needs: [build-python, build-python-sdist]
     runs-on: ubuntu-latest
     if: |
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_TO_PYPI == 'true') ||

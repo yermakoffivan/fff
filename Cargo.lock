@@ -707,7 +707,6 @@ dependencies = [
  "fff-search",
  "git2",
  "pyo3",
- "serde_json",
 ]
 
 [[package]]
