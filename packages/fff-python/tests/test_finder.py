@@ -46,7 +46,7 @@ def sample_dir() -> str:
 
 
 def test_imports_and_package_version() -> None:
-    assert fff.__version__ == metadata.version("fff-python")
+    assert fff.__version__ == metadata.version("fff-search")
     assert GrepCursor(12).offset == 12
     assert "GrepCursor" in fff.__all__
 

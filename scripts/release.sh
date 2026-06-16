@@ -64,14 +64,14 @@ replace_once(
 lock_path = root / "packages/fff-python/uv.lock"
 if lock_path.exists():
     text = lock_path.read_text(encoding="utf-8")
-    marker = '[[package]]\nname = "fff-python"\nversion = "'
+    marker = '[[package]]\nname = "fff-search"\nversion = "'
     start = text.find(marker)
     if start == -1:
-        raise SystemExit(f"failed to find fff-python package in {lock_path}")
+        raise SystemExit(f"failed to find fff-search package in {lock_path}")
     version_start = start + len(marker)
     version_end = text.find('"', version_start)
     if version_end == -1:
-        raise SystemExit(f"failed to find fff-python version end in {lock_path}")
+        raise SystemExit(f"failed to find fff-search version end in {lock_path}")
     text = text[:version_start] + version + text[version_end:]
     lock_path.write_text(text, encoding="utf-8")
 PY

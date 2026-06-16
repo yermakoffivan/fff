@@ -672,7 +672,7 @@ Stable C ABI. Bind from C/C++, Zig, Go via cgo, Python via ctypes, or anything w
 ### Install
 
 ```bash
-pip install fff-python
+pip install fff-search
 ```
 
 Or build and install from source:

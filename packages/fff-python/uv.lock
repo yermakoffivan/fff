@@ -33,7 +33,7 @@ wheels = [
 ]
 
 [[package]]
-name = "fff-python"
+name = "fff-search"
 version = "0.1.0"
 source = { editable = "." }
 

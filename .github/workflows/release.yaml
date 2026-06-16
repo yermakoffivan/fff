@@ -585,7 +585,7 @@ jobs:
 
             ## Python Package
             - `python/*.whl` / `python/*.tar.gz` - Python wheels and sdist
-            - Install from PyPI: `pip install fff-python` (when published)
+            - Install from PyPI: `pip install fff-search` (when published)
 
             Update mcp via:
             ```sh
@@ -622,7 +622,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' && inputs.publish_pypi == true)
     environment:
       name: pypi
-      url: https://pypi.org/p/fff-python
+      url: https://pypi.org/p/fff-search
     permissions:
       contents: read
       id-token: write
