@@ -233,6 +233,18 @@ def test_directory_and_mixed_search(sample_dir: str) -> None:
         assert any(isinstance(item, MixedDirItem) for item in mixed.items)
         assert any(isinstance(item, MixedFileItem) for item in mixed.items)
 
+        # max_access_frecency is the same field on both dir item types, so the
+        # values must agree for a shared directory regardless of which search
+        # produced them.
+        dir_frecency = {
+            rel(item.relative_path): item.max_access_frecency for item in dirs.items
+        }
+        for item in mixed.items:
+            if isinstance(item, MixedDirItem):
+                path = rel(item.relative_path)
+                if path in dir_frecency:
+                    assert item.max_access_frecency == dir_frecency[path]
+
 
 def test_grep_plain_regex_fuzzy_and_context(sample_dir: str) -> None:
     with FileFinder(sample_dir, watch=False, enable_content_indexing=True) as finder:

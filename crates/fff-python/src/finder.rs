@@ -19,12 +19,24 @@ use crate::types::{
 use crate::{parse_grep_mode, py_err};
 
 const DEFAULT_SEARCH_PAGE_SIZE: usize = 100;
+// Sentinel-to-default conversion for combo boosting, mirroring the C/Node
+// bindings: `0` means "use the engine default", not "disable".
+const DEFAULT_COMBO_BOOST_MULTIPLIER: i32 = 100;
+const DEFAULT_MIN_COMBO_COUNT: u32 = 3;
 
 fn defaulted_usize(value: u32, default: usize) -> usize {
     if value == 0 { default } else { value as usize }
 }
 
 fn defaulted_u64(value: u64, default: u64) -> u64 {
+    if value == 0 { default } else { value }
+}
+
+fn defaulted_i32(value: i32, default: i32) -> i32 {
+    if value == 0 { default } else { value }
+}
+
+fn defaulted_u32(value: u32, default: u32) -> u32 {
     if value == 0 { default } else { value }
 }
 
@@ -345,8 +357,8 @@ impl FileFinder {
                     picker.base_path(),
                     page_index,
                     page_size,
-                    combo_boost_score_multiplier,
-                    min_combo_count,
+                    defaulted_i32(combo_boost_score_multiplier, DEFAULT_COMBO_BOOST_MULTIPLIER),
+                    defaulted_u32(min_combo_count, DEFAULT_MIN_COMBO_COUNT),
                 ),
             );
 
@@ -512,8 +524,8 @@ impl FileFinder {
                         picker.base_path(),
                         page_index,
                         page_size,
-                        combo_boost_score_multiplier,
-                        min_combo_count,
+                        defaulted_i32(combo_boost_score_multiplier, DEFAULT_COMBO_BOOST_MULTIPLIER),
+                        defaulted_u32(min_combo_count, DEFAULT_MIN_COMBO_COUNT),
                     ),
                 );
 

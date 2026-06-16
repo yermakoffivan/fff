@@ -72,7 +72,7 @@ impl MixedDirItem {
         Self {
             relative_path: item.relative_path(picker),
             dir_name: item.dir_name(picker),
-            max_access_frecency: item.max_access_frecency() as i64,
+            max_access_frecency: item.max_access_frecency(),
         }
     }
 }

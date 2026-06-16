@@ -132,7 +132,7 @@ pub struct MixedDirItem {
     #[pyo3(get)]
     pub dir_name: String,
     #[pyo3(get)]
-    pub max_access_frecency: i64,
+    pub max_access_frecency: i32,
 }
 
 #[pymethods]
