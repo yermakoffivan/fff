@@ -36,7 +36,7 @@ uv run python examples/basic.py .
 from fff import FileFinder
 
 with FileFinder("/path/to/project", watch=False) as finder:
-    finder.wait_for_scan(timeout_ms=5000)
+    finder.wait_for_scan_blocking(timeout_ms=5000)
     print(f"Indexed under {finder.base_path}")
 
     result = finder.search("main")
@@ -44,6 +44,25 @@ with FileFinder("/path/to/project", watch=False) as finder:
         print(f"Showing {len(result)} of {result.total_matched} matches")
     for item, score in zip(result.items, result.scores):
         print(f"{item.relative_path}: {score.total}")
+```
+
+### Async usage
+
+`wait_for_scan` is a coroutine that polls the scan status and yields to the
+event loop, so it never blocks other tasks. Use `wait_for_scan_blocking` from
+synchronous code.
+
+```python
+import asyncio
+from fff import FileFinder
+
+async def main():
+    with FileFinder("/path/to/project", watch=False) as finder:
+        await finder.wait_for_scan(timeout_ms=5000)
+        result = finder.search("main")
+        print(result)
+
+asyncio.run(main())
 ```
 
 ## Building wheels

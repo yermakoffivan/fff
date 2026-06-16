@@ -30,3 +30,4 @@ exclude = ["src/**/__pycache__/*", "src/**/*.pyc"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"

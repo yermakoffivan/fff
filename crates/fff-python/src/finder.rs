@@ -129,7 +129,7 @@ fn clear_shared_state(
     }
 }
 
-#[pyclass]
+#[pyclass(subclass)]
 pub struct FileFinder {
     picker: SharedFilePicker,
     frecency: SharedFrecency,
@@ -708,7 +708,8 @@ impl FileFinder {
         Ok(guard.as_ref().map(|p| p.is_scan_active()).unwrap_or(false))
     }
 
-    fn wait_for_scan(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<bool> {
+    #[pyo3(signature = (timeout_ms=5000))]
+    fn wait_for_scan_blocking(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<bool> {
         let picker = self.picker.clone();
         py.allow_threads(move || Ok(picker.wait_for_scan(Duration::from_millis(timeout_ms))))
     }

@@ -17,7 +17,7 @@ def main() -> int:
         print(f"Created in {time.time() - start:.2f}s")
 
         print("Waiting for scan...")
-        finder.wait_for_scan(timeout_ms=30000)
+        finder.wait_for_scan_blocking(timeout_ms=30000)
         progress = finder.scan_progress
         print(f"Indexed {progress.scanned_files_count} files")
 

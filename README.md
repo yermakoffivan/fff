@@ -689,7 +689,7 @@ uv run maturin develop --release
 from fff import FileFinder
 
 with FileFinder("/path/to/project", watch=False) as finder:
-    finder.wait_for_scan(timeout_ms=5000)
+    finder.wait_for_scan_blocking(timeout_ms=5000)
 
     result = finder.search("main")
     for item, score in zip(result.items, result.scores):
