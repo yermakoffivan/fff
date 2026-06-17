@@ -368,6 +368,9 @@ jobs:
 
   build-python:
     name: Build Python wheels ${{ matrix.target }} (${{ matrix.os }})
+    # Wheels are release artifacts; PR validation uses the develop build in
+    # python.yml, so skip the cross-compile matrix on pull requests.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -433,6 +436,7 @@ jobs:
 
   build-python-sdist:
     name: Build Python sdist
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
