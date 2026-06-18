@@ -2464,12 +2464,10 @@ mod tests {
         let files = picker.get_files();
         let arena = picker.arena_base_ptr();
 
-        #[allow(deprecated)]
         let options = super::GrepSearchOptions {
             max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 0,
-            smart_case: true,
-            case_mode: None,
+            case_mode: Some(super::CaseMode::Smart),
             file_offset: 0,
             page_limit: 100,
             mode: super::GrepMode::PlainText,
@@ -2479,6 +2477,7 @@ mod tests {
             classify_definitions: false,
             trim_whitespace: false,
             abort_signal: None,
+            ..Default::default()
         };
         let no_cancel = AtomicBool::new(false);
 
@@ -2650,12 +2649,10 @@ mod tests {
         // Run a grep for "unicorn": six files match
         // (a, b, c in base + f, g, h in overflow).
         let query = super::parse_grep_query("unicorn");
-        #[allow(deprecated)]
         let options = super::GrepSearchOptions {
             max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 0,
-            smart_case: true,
-            case_mode: None,
+            case_mode: Some(super::CaseMode::Smart),
             file_offset: 0,
             page_limit: 100,
             mode: super::GrepMode::PlainText,
@@ -2665,6 +2662,7 @@ mod tests {
             classify_definitions: false,
             trim_whitespace: false,
             abort_signal: Some(std::sync::Arc::new(AtomicBool::new(false))),
+            ..Default::default()
         };
         let result = picker.grep(&query, &options);
 

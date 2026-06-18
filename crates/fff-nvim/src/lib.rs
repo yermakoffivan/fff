@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use crate::path_shortening::shorten_path_with_cache;
 use error::IntoLuaResult;
 use fff::file_picker::FilePicker;
@@ -467,13 +466,16 @@ pub fn live_grep(
         Some("smart") => Some(fff::CaseMode::Smart),
         Some("sensitive") => Some(fff::CaseMode::Sensitive),
         Some("insensitive") => Some(fff::CaseMode::Insensitive),
-        _ => None,
+        _ => Some(if smart_case.unwrap_or(true) {
+            fff::CaseMode::Smart
+        } else {
+            fff::CaseMode::Sensitive
+        }),
     };
 
     let options = fff::GrepSearchOptions {
         max_file_size: max_file_size.unwrap_or(10 * 1024 * 1024),
         max_matches_per_file: max_matches_per_file.unwrap_or(200),
-        smart_case: smart_case.unwrap_or(true),
         case_mode,
         file_offset: file_offset.unwrap_or(0),
         page_limit: page_size.unwrap_or(50),
@@ -484,6 +486,7 @@ pub fn live_grep(
         classify_definitions: false,
         trim_whitespace: trim_whitespace.unwrap_or(false),
         abort_signal: None,
+        ..Default::default()
     };
 
     let result = picker.grep(&parsed_query, &options);

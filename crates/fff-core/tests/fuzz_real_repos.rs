@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! Proptest-driven fuzz test against real GitHub repos with a live watcher.
 //!
 //! Clones real repository, runs the simulated close to real user sereies of file system ewvents and
@@ -227,8 +226,7 @@ fn grep_opts(mode: GrepMode) -> GrepSearchOptions {
     GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
-        smart_case: true,
-        case_mode: None,
+        case_mode: Some(fff_search::grep::CaseMode::Smart),
         file_offset: 0,
         page_limit: 500,
         mode,
@@ -238,6 +236,7 @@ fn grep_opts(mode: GrepMode) -> GrepSearchOptions {
         classify_definitions: false,
         trim_whitespace: false,
         abort_signal: None,
+        ..Default::default()
     }
 }
 
