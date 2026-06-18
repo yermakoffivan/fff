@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use crate::path_shortening::shorten_path_with_cache;
 use error::IntoLuaResult;
 use fff::file_picker::FilePicker;

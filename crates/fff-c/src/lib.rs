@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! C FFI bindings for fff-core
 //!
 //! This crate provides C-compatible FFI exports that can be used from any language

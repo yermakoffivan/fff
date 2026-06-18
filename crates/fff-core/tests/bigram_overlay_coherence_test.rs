@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Stress tests for the bigram overlay layer.
 //!
 //! These tests create a real git repository with many files, build the bigram

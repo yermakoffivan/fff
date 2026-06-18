@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Randomized file-system mutation stress test.
 //!
 //! Seeds a directory with ~40 files across diverse content domains, builds the

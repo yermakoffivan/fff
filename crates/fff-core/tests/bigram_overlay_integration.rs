@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Integration test: verify that modifying a file after the bigram index is built
 //! still makes the new content findable via grep (through the overlay layer).
 

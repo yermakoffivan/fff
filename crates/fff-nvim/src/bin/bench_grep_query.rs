@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 /// Single-query grep benchmark with bigram index profiling.
 ///
 /// Usage:

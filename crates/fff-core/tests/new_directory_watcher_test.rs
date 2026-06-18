@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Integration test: verifying that the background watcher dynamically detects
 //! newly created directories and picks up files written inside them.
 //!

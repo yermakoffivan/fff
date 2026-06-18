@@ -388,6 +388,7 @@ impl GrepSearchOptions {
 
 impl Default for GrepSearchOptions {
     fn default() -> Self {
+        #[allow(deprecated)]
         Self {
             max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 200,
@@ -2463,6 +2464,7 @@ mod tests {
         let files = picker.get_files();
         let arena = picker.arena_base_ptr();
 
+        #[allow(deprecated)]
         let options = super::GrepSearchOptions {
             max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 0,
@@ -2648,6 +2650,7 @@ mod tests {
         // Run a grep for "unicorn": six files match
         // (a, b, c in base + f, g, h in overflow).
         let query = super::parse_grep_query("unicorn");
+        #[allow(deprecated)]
         let options = super::GrepSearchOptions {
             max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 0,

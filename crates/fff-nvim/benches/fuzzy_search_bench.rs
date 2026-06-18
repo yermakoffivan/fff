@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use fff::file_picker::{FFFMode, FilePicker};
 use fff::types::PaginationArgs;

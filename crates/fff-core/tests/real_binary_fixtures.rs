@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Real-world binary fixture regression.
 //!
 //! Reproduces the exact bug chain we hit with `codex_view` (4.5 MB ELF, no

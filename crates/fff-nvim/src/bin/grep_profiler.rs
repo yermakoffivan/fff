@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 /// Live grep benchmark profiler for fff.nvim
 ///
 /// Benchmarks the full grep pipeline against a large repository (Linux kernel).

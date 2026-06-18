@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use fff::file_picker::FilePicker;
 /// FFF vs ripgrep comparison benchmark
 ///

@@ -42,6 +42,7 @@ fn cleanup_fuzzy_query(s: &str) -> String {
     out
 }
 
+#[allow(deprecated)]
 fn make_grep_options(
     output_mode: OutputMode,
     mode: GrepMode,

@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Vibe coded stress test: randomized file + git operations driven against the *real*
 //! `BackgroundWatcher`, asserting the git-status invariant after every mutation.
 //!

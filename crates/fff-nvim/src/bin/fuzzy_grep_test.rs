@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 /// Fuzzy grep quality test against ~/dev/lightsource
 ///
 /// Runs queries through the fuzzy grep pipeline and prints results

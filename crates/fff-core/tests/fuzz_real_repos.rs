@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Proptest-driven fuzz test against real GitHub repos with a live watcher.
 //!
 //! Clones real repository, runs the simulated close to real user sereies of file system ewvents and
