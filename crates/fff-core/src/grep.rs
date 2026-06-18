@@ -342,10 +342,9 @@ pub use crate::constants::MAX_FFFILE_SIZE;
 pub struct GrepSearchOptions {
     pub max_file_size: u64,
     pub max_matches_per_file: usize,
+    #[deprecated(note = "use `case_mode` instead")]
     pub smart_case: bool,
-    /// Explicit case mode. When `Some`, overrides `smart_case`. When `None`,
-    /// `smart_case` is used (true => Smart, false => Sensitive). Non-breaking
-    /// addition; existing callers can ignore this field.
+    /// When `Some`, overrides `smart_case`.
     pub case_mode: Option<CaseMode>,
     /// File-based pagination offset: index into the sorted/filtered file list
     /// to start searching from. Pass 0 for the first page, then use
@@ -377,9 +376,8 @@ pub struct GrepSearchOptions {
 }
 
 impl GrepSearchOptions {
-    /// Resolves the effective case mode, preferring explicit `case_mode` over
-    /// the legacy `smart_case` boolean.
-    pub fn effective_case_mode(&self) -> CaseMode {
+    fn effective_case_mode(&self) -> CaseMode {
+        #[allow(deprecated)]
         match self.case_mode {
             Some(m) => m,
             None if self.smart_case => CaseMode::Smart,
