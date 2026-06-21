@@ -22,6 +22,7 @@ import type {
   SearchResult,
 } from "@ff-labs/fff-node";
 import { Type } from "@sinclair/typebox";
+import { AuxFinderPool, routePathConstraint } from "./aux-finders";
 import { buildQuery } from "./query";
 
 // Isomorphic SDK loading. pi hosts run under either bun (omp / oh-my-pi) or
@@ -118,6 +119,7 @@ interface FindCursor {
   pattern: string;
   pageSize: number;
   nextPageIndex: number;
+  auxRoot?: string;
 }
 
 const findCursorCache = new Map<string, FindCursor>();
@@ -318,6 +320,7 @@ export default function fffExtension(pi: ExtensionAPI) {
   // deadlock at the native layer (issue #403).
   let finderPromise: Promise<FileFinderApi> | null = null;
   let activeCwd = process.cwd();
+  let auxPool: AuxFinderPool | null = null;
 
   // Mode resolution: flag > env > default
   let currentMode: FffMode =
@@ -406,6 +409,36 @@ export default function fffExtension(pi: ExtensionAPI) {
       finder = null;
       finderCwd = null;
     }
+    if (auxPool) {
+      auxPool.destroyAll();
+      auxPool = null;
+    }
+  }
+
+  function getAuxPool(): AuxFinderPool {
+    if (!auxPool) {
+      auxPool = new AuxFinderPool({
+        frecencyDbPath,
+        historyDbPath,
+        enableFsRootScanning,
+      });
+    }
+    return auxPool;
+  }
+
+  // Out-of-workspace path constraint -> route to a pooled aux FileFinder
+  // rooted at the requested directory. Returns null when the workspace
+  // finder should handle the call normally.
+  async function resolveFinderForPath(
+    pathParam: string | undefined,
+    pattern: string,
+    exclude: string | string[] | undefined,
+  ): Promise<{ finder: FileFinder; query: string; root: string } | null> {
+    const route = routePathConstraint(pathParam, activeCwd);
+    if (!route) return null;
+    const aux = await getAuxPool().acquire(route.root);
+    const query = buildQuery(route.suffix || undefined, pattern, exclude, route.root);
+    return { finder: aux, query, root: route.root };
   }
 
   async function getMentionItems(
@@ -625,9 +658,16 @@ export default function fffExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal) {
       if (signal?.aborted) throw new Error("Operation aborted");
 
-      const f = await ensureFinder(activeCwd);
+      const aux = await resolveFinderForPath(
+        params.path,
+        params.pattern,
+        params.exclude,
+      );
+      const f = aux ? aux.finder : await ensureFinder(activeCwd);
       const effectiveLimit = Math.max(1, params.limit ?? DEFAULT_GREP_LIMIT);
-      const query = buildQuery(params.path, params.pattern, params.exclude, activeCwd);
+      const query = aux
+        ? aux.query
+        : buildQuery(params.path, params.pattern, params.exclude, activeCwd);
       // Auto-detect: regex if the pattern has regex metacharacters AND parses
       // as a valid regex, otherwise plain literal. The fuzzy fallback below
       // only kicks in for plain mode — regex queries are intentional.
@@ -790,19 +830,26 @@ export default function fffExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal) {
       if (signal?.aborted) throw new Error("Operation aborted");
 
-      const f = await ensureFinder(activeCwd);
-
       // Resume from a prior cursor if supplied — cursor owns query+pageSize so
       // the agent can't accidentally mix patterns across pages.
       const resumed = params.cursor ? getFindCursor(params.cursor) : undefined;
+      const aux = resumed
+        ? resumed.auxRoot
+          ? { finder: await getAuxPool().acquire(resumed.auxRoot), root: resumed.auxRoot }
+          : null
+        : await resolveFinderForPath(params.path, params.pattern, params.exclude);
+      const f = aux ? aux.finder : await ensureFinder(activeCwd);
       const effectiveLimit = resumed
         ? resumed.pageSize
         : Math.max(1, params.limit ?? DEFAULT_FIND_LIMIT);
       const query = resumed
         ? resumed.query
-        : buildQuery(params.path, params.pattern, params.exclude, activeCwd);
+        : aux && "query" in aux
+          ? (aux as { query: string }).query
+          : buildQuery(params.path, params.pattern, params.exclude, activeCwd);
       const pattern = resumed ? resumed.pattern : params.pattern;
       const pageIndex = resumed?.nextPageIndex ?? 0;
+      const auxRoot = resumed?.auxRoot ?? aux?.root;
 
       const searchResult = f.fileSearch(query, {
         pageIndex,
@@ -834,6 +881,7 @@ export default function fffExtension(pi: ExtensionAPI) {
           pattern,
           pageSize: effectiveLimit,
           nextPageIndex: pageIndex + 1,
+          auxRoot,
         });
         notices.push(
           `${remaining} more match${remaining === 1 ? "" : "es"} available. cursor="${cursorId}" to continue`,
