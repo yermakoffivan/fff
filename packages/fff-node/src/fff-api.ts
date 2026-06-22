@@ -108,6 +108,12 @@ export interface InitOptions {
    * `enableFsRootScanning`.
    */
   enableHomeDirScanning?: boolean;
+  /**
+   * Follow symlinks during scan and watcher walks. Off by default —
+   * enabling on cyclic symlink layouts can wedge the watcher. Caller is
+   * responsible for ensuring the indexed tree has no symlink loops.
+   */
+  followSymlinks?: boolean;
 }
 
 /**
