@@ -113,6 +113,76 @@ describe('fff.utils.version', function()
     end)
   end)
 
+  describe('nearest_ancestor_release_tag', function()
+    it('should fall back to nearest stable tag when HEAD is untagged', function()
+      local tmp = vim.fn.tempname()
+      vim.fn.mkdir(tmp, 'p')
+
+      vim.fn.system({ 'git', 'init', '-q', tmp })
+      vim.fn.system({ 'git', '-C', tmp, 'config', 'user.email', 'test@test.com' })
+      vim.fn.system({ 'git', '-C', tmp, 'config', 'user.name', 'Test' })
+
+      local f = io.open(tmp .. '/file.txt', 'w')
+      f:write('one')
+      f:close()
+      vim.fn.system({ 'git', '-C', tmp, 'add', '.' })
+      vim.fn.system({ 'git', '-C', tmp, 'commit', '-q', '-m', 'one' })
+      vim.fn.system({ 'git', '-C', tmp, 'tag', 'v0.1.0' })
+
+      f = io.open(tmp .. '/file.txt', 'w')
+      f:write('two')
+      f:close()
+      vim.fn.system({ 'git', '-C', tmp, 'add', '.' })
+      vim.fn.system({ 'git', '-C', tmp, 'commit', '-q', '-m', 'two' })
+
+      assert.are.equal('v0.1.0', version.nearest_ancestor_release_tag(tmp))
+      vim.fn.delete(tmp, 'rf')
+    end)
+
+    it('should fall back to nightly tag when no stable ancestor exists', function()
+      local tmp = vim.fn.tempname()
+      vim.fn.mkdir(tmp, 'p')
+
+      vim.fn.system({ 'git', 'init', '-q', tmp })
+      vim.fn.system({ 'git', '-C', tmp, 'config', 'user.email', 'test@test.com' })
+      vim.fn.system({ 'git', '-C', tmp, 'config', 'user.name', 'Test' })
+
+      local f = io.open(tmp .. '/file.txt', 'w')
+      f:write('one')
+      f:close()
+      vim.fn.system({ 'git', '-C', tmp, 'add', '.' })
+      vim.fn.system({ 'git', '-C', tmp, 'commit', '-q', '-m', 'one' })
+      vim.fn.system({ 'git', '-C', tmp, 'tag', '0.1.0-nightly.aaaaaaa' })
+
+      f = io.open(tmp .. '/file.txt', 'w')
+      f:write('two')
+      f:close()
+      vim.fn.system({ 'git', '-C', tmp, 'add', '.' })
+      vim.fn.system({ 'git', '-C', tmp, 'commit', '-q', '-m', 'two' })
+
+      assert.are.equal('0.1.0-nightly.aaaaaaa', version.nearest_ancestor_release_tag(tmp))
+      vim.fn.delete(tmp, 'rf')
+    end)
+
+    it('should return nil for a repo with no release tags', function()
+      local tmp = vim.fn.tempname()
+      vim.fn.mkdir(tmp, 'p')
+
+      vim.fn.system({ 'git', 'init', '-q', tmp })
+      vim.fn.system({ 'git', '-C', tmp, 'config', 'user.email', 'test@test.com' })
+      vim.fn.system({ 'git', '-C', tmp, 'config', 'user.name', 'Test' })
+
+      local f = io.open(tmp .. '/file.txt', 'w')
+      f:write('hello')
+      f:close()
+      vim.fn.system({ 'git', '-C', tmp, 'add', '.' })
+      vim.fn.system({ 'git', '-C', tmp, 'commit', '-q', '-m', 'init' })
+
+      assert.is_nil(version.nearest_ancestor_release_tag(tmp))
+      vim.fn.delete(tmp, 'rf')
+    end)
+  end)
+
   describe('resolve', function()
     it('should resolve a version from the real repo', function()
       local info, err = version.resolve(repo_root)

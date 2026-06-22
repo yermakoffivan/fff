@@ -56,6 +56,22 @@ function M.current_release_tag(repo_root)
   return stable or nightly_versioned or dev or other or nightly_alias
 end
 
+--- Find the nearest ancestor commit that owns a downloadable release tag.
+--- Used as a fallback when HEAD itself has no tag (e.g. a `[skip ci]` bump
+--- commit on `main`) — without it, `resolve()` synthesises a per-sha nightly
+--- tag for HEAD that has no published release and the binary download 404s.
+---@param repo_root string
+---@return string|nil tag
+function M.nearest_ancestor_release_tag(repo_root)
+  local stable = git(repo_root, 'describe', '--tags', '--abbrev=0', '--match', 'v*', 'HEAD')
+  if stable and stable:match('^v%d') then return stable end
+
+  local nightly = git(repo_root, 'describe', '--tags', '--abbrev=0', '--match', '*-nightly.*', 'HEAD')
+  if nightly and nightly:match('%-nightly%.') then return nightly end
+
+  return nil
+end
+
 function M.read_base_version(repo_root)
   local cargo_path = repo_root .. '/crates/fff-core/Cargo.toml'
   local f = io.open(cargo_path, 'r')

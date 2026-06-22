@@ -182,8 +182,18 @@ function M.ensure_downloaded(opts, callback)
       return
     end
 
-    -- 2. No local tag — construct the nightly version (bumps patch so
-    --    the prerelease is higher than Cargo.toml base in semver)
+    -- 2. HEAD has no tag — fall back to the nearest ancestor's published release
+    --    tag. This covers `[skip ci]` commits on `main` (e.g. the post-release
+    --    Cargo.toml bump) which never get their own nightly published, so the
+    --    synthesised `{base+1}-nightly.{HEAD-sha}` tag from resolve() 404s.
+    local ancestor_tag = fff_version.nearest_ancestor_release_tag(repo_root)
+    if ancestor_tag then
+      on_release_tag(ancestor_tag)
+      return
+    end
+
+    -- 3. No ancestor tag found either — synthesise the nightly version (bumps
+    --    patch so the prerelease is higher than Cargo.toml base in semver).
     local info, err = fff_version.resolve(repo_root)
     if info then
       on_release_tag(info.release_tag)
