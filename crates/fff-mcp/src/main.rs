@@ -152,6 +152,12 @@ pub(crate) struct Args {
     /// Run a health check and print diagnostic information, then exit.
     #[arg(long = "healthcheck")]
     pub(crate) healthcheck: bool,
+
+    /// Exit after this many seconds without a tool call. 0 disables the watchdog.
+    /// Stopgap for clients that spawn fff-mcp per session but don't reap it on
+    /// exit (see issue #633 / #497). Default 900 (15 min).
+    #[arg(long = "idle-timeout-secs", env = "FFF_MCP_IDLE_TIMEOUT_SECS", default_value_t = 900)]
+    idle_timeout_secs: u64,
 }
 
 /// Resolve default paths for the log file.
@@ -274,6 +280,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create and start the MCP server
     let server = FffServer::new(shared_picker.clone(), shared_frecency.clone());
+    let last_activity = server.last_activity();
+    let idle_timeout_secs = args.idle_timeout_secs;
 
     // Wait for initial scan in background — don't block server startup
     let picker_clone_for_scan = shared_picker.clone();
@@ -298,6 +306,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve(stdio())
         .await
         .map_err(|e| format!("Failed to start MCP server: {}", e))?;
+
+    if idle_timeout_secs > 0 {
+        // Reset baseline now that the server is accepting requests, so a slow
+        // initial scan on a large repo can't trip the watchdog before the
+        // client sends its first tool call.
+        last_activity.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let last_activity_for_watchdog = last_activity.clone();
+        tokio::spawn(async move {
+            let tick = std::time::Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(tick).await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let last = last_activity_for_watchdog.load(std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(last) >= idle_timeout_secs {
+                    tracing::info!(
+                        "Exiting after {}s of inactivity (idle_timeout_secs={})",
+                        now.saturating_sub(last),
+                        idle_timeout_secs
+                    );
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
 
     let picker_for_shutdown = shared_picker.clone();
     tokio::spawn(async move {

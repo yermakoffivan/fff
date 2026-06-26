@@ -5,8 +5,9 @@
 //! `fff-core` APIs (no C FFI overhead).
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cursor::CursorStore;
 use crate::output::{GrepFormatter, OutputMode, file_suffix};
@@ -185,6 +186,14 @@ pub struct FffServer {
     frecency: SharedFrecency,
     cursor_store: Arc<Mutex<CursorStore>>,
     update_notice_sent: Arc<AtomicBool>,
+    last_activity: Arc<AtomicU64>,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl FffServer {
@@ -194,7 +203,18 @@ impl FffServer {
             frecency,
             cursor_store: Arc::new(Mutex::new(CursorStore::new())),
             update_notice_sent: Arc::new(AtomicBool::new(false)),
+            last_activity: Arc::new(AtomicU64::new(now_secs())),
         }
+    }
+
+    /// Shared activity clock. Bumped on every tool call; an idle-watchdog task
+    /// reads it to decide when to terminate an abandoned process.
+    pub fn last_activity(&self) -> Arc<AtomicU64> {
+        self.last_activity.clone()
+    }
+
+    fn bump_activity(&self) {
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
@@ -407,6 +427,7 @@ impl FffServer {
         &self,
         Parameters(params): Parameters<FindFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.bump_activity();
         let max_results = normalize_max_results(params.max_results, 20);
         let query = &params.query;
 
@@ -519,6 +540,7 @@ impl FffServer {
         &self,
         Parameters(params): Parameters<GrepParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.bump_activity();
         let max_results = normalize_max_results(params.max_results, 20);
         let output_mode = OutputMode::new(params.output_mode.as_deref());
 
@@ -553,6 +575,7 @@ impl FffServer {
         &self,
         Parameters(params): Parameters<MultiGrepParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.bump_activity();
         let mut result = self.multi_grep_inner(params)?;
         self.maybe_append_update_notice(&mut result);
         Ok(result)
