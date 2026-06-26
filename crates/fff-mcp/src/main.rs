@@ -153,10 +153,12 @@ pub(crate) struct Args {
     #[arg(long = "healthcheck")]
     pub(crate) healthcheck: bool,
 
-    /// Exit after this many seconds without a tool call. 0 disables the watchdog.
-    /// Stopgap for clients that spawn fff-mcp per session but don't reap it on
-    /// exit (see issue #633 / #497). Default 900 (15 min).
-    #[arg(long = "idle-timeout-secs", env = "FFF_MCP_IDLE_TIMEOUT_SECS", default_value_t = 900)]
+    /// Exit after this many seconds of inactivity. 0 = never exit.
+    #[arg(
+        long = "idle-timeout-secs",
+        env = "FFF_MCP_IDLE_TIMEOUT_SECS",
+        default_value_t = 900
+    )]
     idle_timeout_secs: u64,
 }
 
@@ -258,7 +260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize file picker (spawns background scan + watcher)
     FilePicker::new_with_shared_state(
         shared_picker.clone(),
-        shared_frecency.clone(),
+        shared_frecency,
         fff::FilePickerOptions {
             base_path,
             enable_mmap_cache: !args.no_warmup,
@@ -279,7 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create and start the MCP server
-    let server = FffServer::new(shared_picker.clone(), shared_frecency.clone());
+    let server = FffServer::new(shared_picker.clone());
     let last_activity = server.last_activity();
     let idle_timeout_secs = args.idle_timeout_secs;
 
@@ -302,15 +304,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let service = server
-        .serve(stdio())
-        .await
-        .map_err(|e| format!("Failed to start MCP server: {}", e))?;
+    const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let service = match tokio::time::timeout(STARTUP_TIMEOUT, server.serve(stdio())).await {
+        Ok(res) => res.map_err(|e| format!("Failed to start MCP server: {}", e))?,
+        Err(_) => {
+            return Err("MCP initialize handshake did not complete within 60s".into());
+        }
+    };
 
     if idle_timeout_secs > 0 {
-        // Reset baseline now that the server is accepting requests, so a slow
-        // initial scan on a large repo can't trip the watchdog before the
-        // client sends its first tool call.
         last_activity.store(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -318,6 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(0),
             std::sync::atomic::Ordering::Relaxed,
         );
+
         let last_activity_for_watchdog = last_activity.clone();
         tokio::spawn(async move {
             let tick = std::time::Duration::from_secs(60);
@@ -327,6 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
+
                 let last = last_activity_for_watchdog.load(std::sync::atomic::Ordering::Relaxed);
                 if now.saturating_sub(last) >= idle_timeout_secs {
                     tracing::info!(
