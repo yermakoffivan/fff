@@ -151,6 +151,17 @@ https://github.com/user-attachments/assets/5d0e1ce9-642c-4c44-aa88-01b05bb86abb
       function() require('fff').live_grep({ query = vim.fn.expand("<cword>") }) end,
       desc = 'Search current word',
     },
+    { "fc",
+      function()
+        local saved = vim.fn.getreg('v')
+        vim.cmd('normal! "vy')
+        local query = vim.fn.getreg('v'):gsub('\n', '')
+        vim.fn.setreg('v', saved)
+        require('fff').live_grep({ query = query })
+      end,
+      mode = 'x',
+      desc = 'Search visual selection',
+    },
   },
 }
 ```
