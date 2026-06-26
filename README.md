@@ -148,19 +148,9 @@ https://github.com/user-attachments/assets/5d0e1ce9-642c-4c44-aa88-01b05bb86abb
       desc = 'Live fffuzy grep',
     },
     { "fc",
-      function() require('fff').live_grep({ query = vim.fn.expand("<cword>") }) end,
-      desc = 'Search current word',
-    },
-    { "fc",
-      function()
-        local saved = vim.fn.getreg('v')
-        vim.cmd('normal! "vy')
-        local query = vim.fn.getreg('v'):gsub('\n', '')
-        vim.fn.setreg('v', saved)
-        require('fff').live_grep({ query = query })
-      end,
-      mode = 'x',
-      desc = 'Search visual selection',
+      function() require('fff').live_grep_under_cursor() end,
+      mode = { 'n', 'x' },
+      desc = 'Search current word / selection',
     },
   },
 }
@@ -194,6 +184,7 @@ vim.keymap.set('n', 'ff', function() require('fff').find_files() end, { desc = '
 ```lua
 require('fff').find_files()                        -- find files in current repo
 require('fff').live_grep()                         -- live content grep
+require('fff').live_grep_under_cursor()            -- grep <cword> in normal, selection in visual
 require('fff').scan_files()                        -- force rescan
 require('fff').refresh_git_status()                -- refresh git status
 require('fff').find_files_in_dir(path)             -- find in a specific dir

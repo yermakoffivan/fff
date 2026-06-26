@@ -56,6 +56,24 @@ function M.live_grep(opts)
   picker_ui.open(picker_opts)
 end
 
+--- Live grep prefilled with the current word (normal mode) or the visual selection (visual mode).
+--- @param opts? table Forwarded to `live_grep`; `query` is overwritten by the resolved text.
+function M.live_grep_under_cursor(opts)
+  local mode = vim.fn.mode()
+  local query
+  if mode == 'v' or mode == 'V' or mode == '\22' then
+    local saved = vim.fn.getreg('v')
+    vim.cmd('normal! "vy')
+    query = (vim.fn.getreg('v') or ''):gsub('\n', ' ')
+    vim.fn.setreg('v', saved)
+  else
+    query = vim.fn.expand('<cword>')
+  end
+
+  opts = vim.tbl_deep_extend('force', opts or {}, { query = query })
+  M.live_grep(opts)
+end
+
 --- Changes the directory indexed by the file picker to the git root and opens the file picker
 --- @deprecated Use `find_files` instead
 function M.find_in_git_root()
