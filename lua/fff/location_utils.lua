@@ -202,9 +202,13 @@ function M.highlight_grep_matches(bufnr, location, namespace)
 
   if not search_text or search_text == '' then return nil end
 
-  -- Build case-insensitive pattern if the query has no uppercase (smart case)
+  -- Build case-insensitive pattern if the query has no uppercase (smart case).
+  -- No vim.pesc: string.find below uses plain=true (4th arg), which treats the
+  -- needle as a literal byte sequence. Escaping here would turn `.` into `%.`
+  -- and then plain search would look for the literal two bytes `%.`, missing
+  -- every real `.` in content. Same for any other Lua-pattern metachar.
   local has_upper = search_text:match('[A-Z]')
-  local escaped = vim.pesc(search_text)
+  local needle = search_text
 
   -- Highlight pattern occurrences in a window around the target line.
   -- Limit to ±200 lines from target to keep it fast for large files.
@@ -218,7 +222,7 @@ function M.highlight_grep_matches(bufnr, location, namespace)
   for idx, line in ipairs(lines) do
     local i = scan_start + idx - 1
     local search_line = has_upper and line or line:lower()
-    local search_pat = has_upper and escaped or escaped:lower()
+    local search_pat = has_upper and needle or needle:lower()
     local start_pos = 1
     while true do
       local s, e = search_line:find(search_pat, start_pos, true)
