@@ -62,10 +62,13 @@ function M.live_grep_under_cursor(opts)
   local mode = vim.fn.mode()
   local query
   if mode == 'v' or mode == 'V' or mode == '\22' then
-    local saved = vim.fn.getreg('v')
-    vim.cmd('normal! "vy')
-    query = (vim.fn.getreg('v') or ''):gsub('\n', ' ')
-    vim.fn.setreg('v', saved)
+    -- Exit visual so '< / '> marks settle, then read the range directly —
+    -- no yank, no register clobber.
+    vim.cmd('normal! ' .. vim.api.nvim_replace_termcodes('<Esc>', true, false, true))
+    local s = vim.fn.getpos("'<")
+    local e = vim.fn.getpos("'>")
+    local lines = vim.fn.getregion(s, e, { type = mode })
+    query = table.concat(lines, ' ')
   else
     query = vim.fn.expand('<cword>')
   end
