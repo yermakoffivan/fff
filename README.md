@@ -147,7 +147,7 @@ https://github.com/user-attachments/assets/5d0e1ce9-642c-4c44-aa88-01b05bb86abb
       function() require('fff').live_grep({ grep = { modes = { 'fuzzy', 'plain' } } }) end,
       desc = 'Live fffuzy grep',
     },
-    { "fc",
+    { "fw",
       function() require('fff').live_grep_under_cursor() end,
       mode = { 'n', 'x' },
       desc = 'Search current word / selection',
