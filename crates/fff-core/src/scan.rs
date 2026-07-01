@@ -208,17 +208,13 @@ impl ScanJob {
             return;
         }
 
-        // Files are now searchable — flip the scan signal *early* so
-        // UI progress polls see the picker as "ready" while we run the
-        // optional post-scan steps in the background.
-        signals.scanning.store(false, Ordering::Relaxed);
-
-        // in case we do a rescan, we have to resubscribe a watcher to the new set of directories
-        // all the already watched directories are not going to be resubscribed
-        if !config.install_watcher && !signals.cancelled.load(Ordering::Acquire) {
-            rescubscribe_watcher_post_scan(&shared_picker);
-        }
-
+        // Acquire the post-scan snapshot BEFORE clearing `scanning`. Taking the
+        // snapshot sets `post_scan_indexing_active`, so at least one readiness
+        // signal stays set continuously from scan start until post-scan work
+        // completes. Clearing `scanning` first opened a window where both
+        // signals read false and `wait_for_indexing_complete` could return
+        // before the binary sniff / bigram build ran — a Windows-CI flake in
+        // `real_binary_fixtures`.
         let mut snapshot = if !signals.cancelled.load(Ordering::Acquire) {
             shared_picker.read().ok().and_then(|guard| {
                 guard
@@ -228,6 +224,16 @@ impl ScanJob {
         } else {
             None
         };
+
+        // Files are now searchable — flip the scan signal so UI progress polls
+        // see the picker as "ready" while we run the post-scan steps.
+        signals.scanning.store(false, Ordering::Relaxed);
+
+        // in case we do a rescan, we have to resubscribe a watcher to the new set of directories
+        // all the already watched directories are not going to be resubscribed
+        if !config.install_watcher && !signals.cancelled.load(Ordering::Acquire) {
+            rescubscribe_watcher_post_scan(&shared_picker);
+        }
 
         // 3. Post-scan warmup + bigram build — runs in parallel with the
         // git-status thread to overlap the two expensive phases.

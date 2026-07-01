@@ -9,6 +9,7 @@ use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
 use crate::query_tracker::QueryTracker;
 use crate::scan::ScanJob;
+use git2::Repository;
 
 /// Poll `.git/index.lock` until it disappears (git write completed), giving up
 /// after [`GIT_LOCK_MAX_WAIT`]. Used by [`SharedPicker::refresh_git_status`]
@@ -72,12 +73,18 @@ pub struct SharedFilePicker(pub(crate) Arc<SharedPickerInner>);
 
 pub struct SharedPickerInner {
     picker: parking_lot::RwLock<Option<FilePicker>>,
+    // Serializes every git-status read+apply (full rescans and per-path
+    // updates alike) so the two steps stay atomic as a unit. Without it a
+    // snapshot read from the pre-commit index can be applied *after* a
+    // post-commit one, leaving stale INDEX_* bits that never converge.
+    git_status_update: parking_lot::Mutex<()>,
 }
 
 impl Default for SharedPickerInner {
     fn default() -> Self {
         Self {
             picker: parking_lot::RwLock::new(None),
+            git_status_update: parking_lot::Mutex::new(()),
         }
     }
 }
@@ -220,15 +227,18 @@ impl SharedFilePicker {
     pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
         use tracing::debug;
 
-        let git_status = {
-            let guard = self.read()?;
-            let Some(ref picker) = *guard else {
-                return Err(Error::FilePickerMissing);
-            };
+        // Hold the serialization lock across the whole read+apply so no other
+        // status updater can interleave and clobber us with a stale snapshot.
+        let _serialize = self.0.git_status_update.lock();
 
-            let git_root = picker.git_root().map(|p| p.to_path_buf());
-            drop(guard); // updating git status could take very long time, there is not risky as we
-            // do not allow any mutations and deletions of files from the sync
+        let git_status = {
+            let git_root = {
+                let guard = self.read()?;
+                let Some(ref picker) = *guard else {
+                    return Err(Error::FilePickerMissing);
+                };
+                picker.git_root().map(|p| p.to_path_buf())
+            };
 
             debug!(?git_root, "Refreshing git status for picker");
 
@@ -254,6 +264,43 @@ impl SharedFilePicker {
         };
 
         Ok(statuses_count)
+    }
+
+    /// Recompute and apply git status for a specific set of paths.
+    ///
+    /// Serialized against [`Self::refresh_git_status`] via the same lock and
+    /// waits for any in-flight `.git/index.lock` first, so it never reads a
+    /// half-written index mid-commit and never races a full rescan.
+    pub fn update_git_status_for_paths(
+        &self,
+        paths: &[PathBuf],
+        shared_frecency: &SharedFrecency,
+    ) -> Result<(), Error> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let _serialize = self.0.git_status_update.lock();
+
+        let git_root = {
+            let guard = self.read()?;
+            let Some(ref picker) = *guard else {
+                return Err(Error::FilePickerMissing);
+            };
+            picker.git_root().map(|p| p.to_path_buf())
+        };
+        let Some(git_root) = git_root else {
+            return Ok(());
+        };
+
+        wait_for_git_index_lock_release(&git_root);
+
+        let repo = Repository::open(&git_root)?;
+        let status = GitStatusCache::git_status_for_paths(&repo, paths)?;
+
+        let mut guard = self.write()?;
+        let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
+        picker.update_git_statuses(status, shared_frecency)
     }
 }
 

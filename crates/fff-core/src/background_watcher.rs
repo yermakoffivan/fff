@@ -1,7 +1,7 @@
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
 use crate::file_picker::FFFMode;
-use crate::git::GitStatusCache;
+use crate::git_status_worker::{GitStatusMailbox, spawn_consumer};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
 use git2::Repository;
@@ -23,6 +23,8 @@ pub struct BackgroundWatcher {
     debouncer: Arc<Mutex<Option<Debouncer>>>,
     watch_tx: Option<mpsc::Sender<PathBuf>>,
     owner_thread: Option<std::thread::JoinHandle<()>>,
+    git_status_mailbox: Arc<GitStatusMailbox>,
+    git_status_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(50);
@@ -82,9 +84,20 @@ impl BackgroundWatcher {
         let (watch_tx, watch_rx) = mpsc::channel::<PathBuf>();
         let watch_tx_for_debouncer = watch_tx.clone();
 
+        // Single-consumer git-status pipeline. Producers (debouncer + owner
+        // thread) only enqueue; this dedicated consumer applies updates in
+        // order, so a stale snapshot can never clobber a fresh one.
+        let git_status_mailbox = GitStatusMailbox::new();
+        let git_status_thread = spawn_consumer(
+            shared_picker.weaken(),
+            shared_frecency.clone(),
+            Arc::clone(&git_status_mailbox),
+            trace_span.clone(),
+        );
+
         let owner_weak_picker = shared_picker.weaken();
-        let owner_frecency = shared_frecency.clone();
         let owner_git_workdir = git_workdir.clone();
+        let owner_mailbox = Arc::clone(&git_status_mailbox);
 
         let debouncer = Self::create_debouncer(
             base_path,
@@ -94,6 +107,7 @@ impl BackgroundWatcher {
             mode,
             use_recursive,
             watch_tx_for_debouncer,
+            Arc::clone(&git_status_mailbox),
         )?;
 
         info!("Background file watcher initialized successfully");
@@ -146,8 +160,8 @@ impl BackgroundWatcher {
                     track_files_from_new_directories(
                         &dir,
                         &strong_picker,
-                        &owner_frecency,
                         &owner_git_workdir,
+                        &owner_mailbox,
                     );
 
                     // Transient strong ref drops here, back
@@ -162,9 +176,12 @@ impl BackgroundWatcher {
             debouncer,
             watch_tx: Some(watch_tx),
             owner_thread: Some(owner_thread),
+            git_status_mailbox,
+            git_status_thread: Some(git_status_thread),
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_debouncer(
         base_path: PathBuf,
         git_workdir: Option<PathBuf>,
@@ -173,6 +190,7 @@ impl BackgroundWatcher {
         mode: FFFMode,
         use_recursive: bool,
         watch_tx: mpsc::Sender<PathBuf>,
+        git_status_mailbox: Arc<GitStatusMailbox>,
     ) -> Result<Debouncer, Error> {
         let config = Config::default()
             // do not follow symlinks as then notifiers spawns a bunch of events for symlinked
@@ -217,6 +235,7 @@ impl BackgroundWatcher {
                             &strong_picker,
                             &shared_frecency,
                             mode,
+                            &git_status_mailbox,
                         );
 
                         // every new directory creates had to be reflected in the picker state
@@ -363,6 +382,13 @@ impl BackgroundWatcher {
 
         self.owner_thread.take();
 
+        // Wake the git-status consumer so it exits on its next loop, then
+        // detach it. Never joined here for the same reason the owner thread
+        // isn't: the consumer takes `SharedFilePicker::write()`, and a caller
+        // holding that lock would deadlock on a blocking join.
+        self.git_status_mailbox.signal_shutdown();
+        self.git_status_thread.take();
+
         info!("Background file watcher stop signaled");
     }
 
@@ -388,7 +414,7 @@ impl Drop for BackgroundWatcher {
     }
 }
 
-#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency), level = Level::DEBUG)]
+#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency, git_status_mailbox), level = Level::DEBUG)]
 fn handle_debounced_events(
     events: Vec<DebouncedEvent>,
     base_path: &Path,
@@ -396,6 +422,7 @@ fn handle_debounced_events(
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
     mode: FFFMode,
+    git_status_mailbox: &Arc<GitStatusMailbox>,
 ) -> Vec<PathBuf> {
     // this will be called very often, we have to minimiy the lock time for file picker
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
@@ -659,54 +686,18 @@ fn handle_debounced_events(
         }
     }
 
-    // do not try to update the paths if we anyway going to rescan everything from scratch
-    if !need_full_rescan && (need_full_git_rescan || !files_to_update_git_status.is_empty()) {
-        let git_workdir = repo
-            .as_ref()
-            .map(|r| r.workdir().unwrap_or_else(|| r.path()).to_path_buf());
-
-        let shared_picker = shared_picker.clone();
-        let shared_frecency = shared_frecency.clone();
-
-        // git status query even with a pathspec could be really slow, if we do this syncrhronously
-        // within the event handler, we actually risk of forming a snow ball of conflicting events
-        crate::parallelism::BACKGROUND_THREAD_POOL.spawn(move || {
-            let Some(git_path) = git_workdir else { return };
-            let Ok(repo) = Repository::open(&git_path) else {
-                error!("Failed to open git repo for async status update");
-                return;
-            };
-
-            if need_full_git_rescan && !need_full_rescan {
-                info!("Async: triggering full git rescan");
-                if let Err(e) = shared_picker.refresh_git_status(&shared_frecency) {
-                    error!("Failed to refresh git status: {:?}", e);
-                }
-            }
-
-            if !files_to_update_git_status.is_empty() {
-                let status = match GitStatusCache::git_status_for_paths(
-                    &repo,
-                    &files_to_update_git_status,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to query git status: {:?}", e);
-                        return;
-                    }
-                };
-
-                if let Ok(mut guard) = shared_picker.write()
-                    && let Some(ref mut picker) = *guard
-                {
-                    if let Err(e) = picker.update_git_statuses(status, &shared_frecency) {
-                        error!("Failed to update git statuses: {:?}", e);
-                    } else {
-                        info!("Async: git statuses updated");
-                    }
-                }
-            }
-        });
+    // Enqueue git-status work onto the dedicated consumer instead of doing it
+    // here: the debouncer thread must never block on a (potentially slow) git
+    // read, and the single consumer keeps updates ordered. Skip entirely when a
+    // full filesystem rescan is queued — that path recomputes git status itself.
+    if !need_full_rescan {
+        if need_full_git_rescan {
+            // A full git rescan re-reads every tracked path (including ones that
+            // just went clean after a commit), so it supersedes per-path work.
+            git_status_mailbox.request_full_rescan();
+        } else if !files_to_update_git_status.is_empty() {
+            git_status_mailbox.enqueue_paths(files_to_update_git_status);
+        }
     }
 
     new_dirs_to_watch
@@ -717,8 +708,8 @@ fn handle_debounced_events(
 fn track_files_from_new_directories(
     dir: &Path,
     shared_picker: &SharedFilePicker,
-    shared_frecency: &SharedFrecency,
     git_workdir: &Option<PathBuf>,
+    git_status_mailbox: &Arc<GitStatusMailbox>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -750,6 +741,8 @@ fn track_files_from_new_directories(
         return;
     }
 
+    let added = files_to_add.len();
+
     {
         let Ok(mut guard) = shared_picker.write() else {
             return;
@@ -764,26 +757,15 @@ fn track_files_from_new_directories(
         }
     }
 
-    if let Some(repo) = repo.as_ref() {
-        let status = match GitStatusCache::git_status_for_paths(repo, &files_to_add) {
-            Ok(status) => status,
-            Err(e) => {
-                tracing::error!(?e, "inject_existing_files: git status query failed");
-                return;
-            }
-        };
-
-        if let Ok(mut guard) = shared_picker.write()
-            && let Some(ref mut picker) = *guard
-            && let Err(e) = picker.update_git_statuses(status, shared_frecency)
-        {
-            error!("inject_existing_files: failed to update git statuses: {e:?}");
-        }
+    // Hand the git-status refresh to the dedicated consumer (ordered + off the
+    // owner thread). It no-ops when there is no git repo.
+    if repo.is_some() {
+        git_status_mailbox.enqueue_paths(files_to_add);
     }
 
     debug!(
         "Injected {} existing files from new directory {}",
-        files_to_add.len(),
+        added,
         dir.display(),
     );
 }

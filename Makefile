@@ -236,7 +236,7 @@ test-stress-random:
 		-p fff-search \
 		--test fuzz_git_watcher_stress \
 		--no-default-features --features zlob \
-		-- --nocapture stress_random
+		-- --nocapture stress_random stress_regresion
 
 test-stress-repos:
 	RUSTFLAGS="$(STRESS_RUSTFLAGS)" \
