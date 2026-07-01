@@ -144,6 +144,7 @@ mod ignore;
 /// Thread-safe shared handles for [`FilePicker`], [`FrecencyTracker`],
 /// and [`QueryTracker`].
 pub mod shared;
+pub mod walk;
 
 pub use bigram_filter::*;
 pub use dbs::db_healthcheck::{DbHealth, DbHealthChecker};

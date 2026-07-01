@@ -38,6 +38,7 @@ pub(crate) const PLATFORM_IGNORED_DIRS: &[&str] = &[
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(crate) const PLATFORM_IGNORED_DIRS: &[&str] = &[];
 
+#[cfg(not(feature = "zlob"))]
 pub(crate) fn non_git_repo_overrides(base_path: &Path) -> Option<ignore::overrides::Override> {
     use ignore::overrides::OverrideBuilder;
 
