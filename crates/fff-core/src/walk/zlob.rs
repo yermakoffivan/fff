@@ -85,7 +85,21 @@ pub(crate) fn walk_collect_files(
             .unwrap_or(0);
 
         let basename_offset = entry.basename_offset_in_relative();
-        let rel_str = String::from_utf8_lossy(rel_bytes).into_owned();
+        // zlob always emits '/'-separated relative paths. The rest of the
+        // index (find_file_index, the watcher, remove_file_by_path) works in
+        // native separators, so normalize to '\' on Windows to keep lookups
+        // consistent with the ripgrep backend.
+        let rel_str = {
+            let s = String::from_utf8_lossy(rel_bytes);
+            #[cfg(windows)]
+            {
+                s.replace('/', "\\")
+            }
+            #[cfg(not(windows))]
+            {
+                s.into_owned()
+            }
+        };
         let item = FileItem::new_raw(basename_offset, size, modified, None, is_binary);
 
         let mut guard = pairs.lock();

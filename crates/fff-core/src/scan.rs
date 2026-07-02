@@ -346,11 +346,17 @@ impl ScanJob {
                     non_indexable_files,
                     &unsafe_snapshot.base_path,
                     arena,
+                    &signals.cancelled,
                 );
             }
         } else {
             // this potentially a long running as we are not parallelizing it but it's okay
-            sniff_binary_for_non_indexable(files, &unsafe_snapshot.base_path, arena);
+            sniff_binary_for_non_indexable(
+                files,
+                &unsafe_snapshot.base_path,
+                arena,
+                &signals.cancelled,
+            );
         }
 
         // TODO Skipped as potentially unsafe - figure this out later

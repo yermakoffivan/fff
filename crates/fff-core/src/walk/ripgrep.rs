@@ -1,6 +1,3 @@
-//! Filesystem traversal backed by the `ignore` crate (ripgrep's walker).
-//! Default backend, used whenever the `zlob` feature is disabled.
-
 use crate::background_watcher::is_git_file;
 use crate::ignore::non_git_repo_overrides;
 use crate::types::FileItem;
@@ -12,10 +9,6 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-/// Walk `base_path` in parallel and collect every non-ignored file as a
-/// `(FileItem, relative_path)` pair. The `ignore` crate does not surface a
-/// reusable matcher, so [`WalkOutput::ignore_rules`] is always `None` and
-/// callers fall back to libgit2.
 #[tracing::instrument(skip_all, name = "ripgrep walker", level = "info")]
 pub(crate) fn walk_collect_files(
     base_path: &Path,

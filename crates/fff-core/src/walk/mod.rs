@@ -18,25 +18,14 @@ mod ripgrep;
 #[cfg(not(feature = "zlob"))]
 pub(crate) use ripgrep::walk_collect_files;
 
-/// Result of a filesystem walk: the collected `(FileItem, relative_path)`
-/// pairs plus, when the backend supports it, the ignore rules gathered during
-/// traversal (nested `.gitignore` + `.ignore`).
 pub(crate) struct WalkOutput {
     pub(crate) pairs: Vec<(FileItem, String)>,
-    /// Reusable ignore matcher. `Some` only for the zlob backend, which
-    /// surfaces the rules it assembled during the walk. The `ignore`-crate
-    /// backend returns `None` and callers fall back to libgit2.
     pub(crate) ignore_rules: Option<WalkIgnoreRules>,
 }
 
-/// Owned, reusable view of the ignore rules a walk discovered. Keeps the
-/// backing walk storage alive so root-relative paths can be tested long after
-/// the walk finished (e.g. from the background watcher).
 pub(crate) struct WalkIgnoreRules {
     #[cfg(feature = "zlob")]
     inner: ::zlob::walk::WalkerOutcomeRules,
-    // Placeholder so the struct is inhabited even without a backend that
-    // produces rules. Never constructed by the ripgrep backend.
     #[cfg(not(feature = "zlob"))]
     _never: std::convert::Infallible,
 }
@@ -64,7 +53,7 @@ impl WalkIgnoreRules {
         {
             self.inner
                 .rules()
-                .is_some_and(|r| r.is_ignored(relative_path))
+                .is_some_and(|rules| rules.is_ignored(relative_path))
         }
         #[cfg(not(feature = "zlob"))]
         {
