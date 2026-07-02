@@ -208,6 +208,9 @@ impl FileSync {
                 }
             }
         };
+        // The dir table and stored file paths are '/'-canonical; fold the
+        // native relative path so the byte-wise comparisons below match.
+        let rel_path_owned = crate::path_utils::to_canonical_slashes(&rel_path_owned).into_owned();
         let rel_path: &str = &rel_path_owned;
 
         // Split into directory (with trailing '/') and filename.
@@ -313,7 +316,9 @@ impl FileItem {
         metadata: Option<&std::fs::Metadata>,
     ) -> (Self, String) {
         let path_buf = pathdiff::diff_paths(&path, base_path).unwrap_or_else(|| path.clone());
-        let relative_path = path_buf.to_string_lossy().into_owned();
+        // The index is '/'-canonical on every platform; fold native separators.
+        let relative_path =
+            crate::path_utils::to_canonical_slashes(&path_buf.to_string_lossy()).into_owned();
 
         let (size, modified) = match metadata {
             Some(metadata) => {
@@ -380,7 +385,8 @@ impl FileItem {
         let is_binary = is_known_binary_extension(path);
 
         let rel = pathdiff::diff_paths(path, base_path).unwrap_or_else(|| path.to_path_buf());
-        let rel_str = rel.to_string_lossy().into_owned();
+        // The index is '/'-canonical on every platform; fold native separators.
+        let rel_str = crate::path_utils::to_canonical_slashes(&rel.to_string_lossy()).into_owned();
         let fname_offset = rel_str
             .rfind(std::path::is_separator)
             .map(|i| i + 1)
@@ -1645,7 +1651,8 @@ impl FilePicker {
         let dir_prefix = if relative_dir.is_empty() {
             String::new()
         } else {
-            format!("{}{}", relative_dir, std::path::MAIN_SEPARATOR)
+            // Stored relative paths are '/'-canonical on every platform.
+            format!("{relative_dir}/")
         };
 
         self.sync_data.tombstone_files_with_arena(|file, arena| {
@@ -1693,7 +1700,8 @@ impl FilePicker {
         if let Ok(stripped) = path.strip_prefix(&self.base_path)
             && let Some(s) = stripped.to_str()
         {
-            return Some(std::borrow::Cow::Borrowed(s));
+            // Callers compare against '/'-canonical stored paths.
+            return Some(crate::path_utils::to_canonical_slashes(s));
         }
 
         #[cfg(windows)]
@@ -1716,7 +1724,7 @@ fn canonical_relative_path(path: &Path, base: &Path) -> Option<String> {
         && let Ok(stripped) = canonical.strip_prefix(base)
         && let Some(s) = stripped.to_str()
     {
-        return Some(s.to_owned());
+        return Some(crate::path_utils::to_canonical_slashes(s).into_owned());
     }
 
     // Deleted files can't be canonicalized — canonicalize the parent and
@@ -1727,7 +1735,8 @@ fn canonical_relative_path(path: &Path, base: &Path) -> Option<String> {
     let stripped_parent = canonical_parent.strip_prefix(base).ok()?;
     let mut rel = stripped_parent.to_path_buf();
     rel.push(file_name);
-    rel.to_str().map(str::to_owned)
+    rel.to_str()
+        .map(|s| crate::path_utils::to_canonical_slashes(s).into_owned())
 }
 
 impl Drop for FilePicker {
