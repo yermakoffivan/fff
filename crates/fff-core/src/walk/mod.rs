@@ -34,7 +34,7 @@ pub(crate) struct WalkOutput {
 /// the walk finished (e.g. from the background watcher).
 pub(crate) struct WalkIgnoreRules {
     #[cfg(feature = "zlob")]
-    inner: self::zlob::OwnedIgnoreRules,
+    inner: ::zlob::walk::WalkerOutcomeRules,
     // Placeholder so the struct is inhabited even without a backend that
     // produces rules. Never constructed by the ripgrep backend.
     #[cfg(not(feature = "zlob"))]
@@ -62,8 +62,9 @@ impl WalkIgnoreRules {
     pub(crate) fn is_ignored(&self, relative_path: &Path) -> bool {
         #[cfg(feature = "zlob")]
         {
-            let s = relative_path.to_string_lossy();
-            self.inner.rules().is_ignored(s.as_ref())
+            self.inner
+                .rules()
+                .is_some_and(|r| r.is_ignored(relative_path))
         }
         #[cfg(not(feature = "zlob"))]
         {
@@ -101,7 +102,7 @@ mod tests {
         fs::write(root.join("target/out.bin"), "bin").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, true, false, 1, &counter);
+        let out = walk_collect_files(root, true, false, 1, &counter).unwrap();
 
         let mut names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
         names.sort();
@@ -125,7 +126,7 @@ mod tests {
         fs::write(root.join("index.js"), "x").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, false, false, 1, &counter);
+        let out = walk_collect_files(root, false, false, 1, &counter).unwrap();
         let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
 
         assert!(names.iter().any(|n| n.ends_with("index.js")));
@@ -146,7 +147,7 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "x").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, true, false, 1, &counter);
+        let out = walk_collect_files(root, true, false, 1, &counter).unwrap();
 
         let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
         assert!(rules.is_ignored(Path::new("target/")));

@@ -82,6 +82,7 @@ fn load_file_contents(base_path: &Path) -> Vec<Vec<u8>> {
     let max_size = 10 * 1024 * 1024u64;
 
     let _ = WalkBuilder::new(base_path)
+        .expect("WalkBuilder::new")
         .options(WalkFlags::GITIGNORE)
         .metadata(WalkMetadata::SIZE)
         .run_serial(|entry| {

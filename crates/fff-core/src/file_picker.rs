@@ -1849,7 +1849,7 @@ impl FileSync {
             follow_symlinks,
             bg_threads,
             synced_files_count,
-        );
+        )?;
         let ignore_rules = walk_output.ignore_rules.take().map(Arc::new);
         let mut pairs = walk_output.pairs;
 
@@ -2035,7 +2035,24 @@ pub fn is_known_binary_extension(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
+    is_binary_extension_str(ext)
+}
 
+/// Like [`is_known_binary_extension`] but takes a basename string directly,
+/// avoiding `Path::extension()` overhead. Mirrors `Path::extension()`
+/// semantics: dotfiles with no other dots → no extension. Used by the zlob
+/// walker, which already has the basename slice from traversal.
+#[cfg(feature = "zlob")]
+#[inline]
+pub(crate) fn is_known_binary_extension_basename(name: &str) -> bool {
+    match name.rfind('.') {
+        Some(pos) if pos > 0 && pos < name.len() - 1 => is_binary_extension_str(&name[pos + 1..]),
+        _ => false,
+    }
+}
+
+#[inline]
+fn is_binary_extension_str(ext: &str) -> bool {
     matches!(
         ext,
         // Images

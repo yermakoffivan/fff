@@ -2,7 +2,6 @@
 //! Default backend, used whenever the `zlob` feature is disabled.
 
 use crate::background_watcher::is_git_file;
-use crate::file_picker::is_known_binary_extension;
 use crate::ignore::non_git_repo_overrides;
 use crate::types::FileItem;
 use crate::walk::WalkOutput;
@@ -24,7 +23,7 @@ pub(crate) fn walk_collect_files(
     follow_symlinks: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
-) -> WalkOutput {
+) -> crate::Result<WalkOutput> {
     let mut walk_builder = WalkBuilder::new(base_path);
     walk_builder
         // this is a very important guard for the user opening ~/ or other root non-git dir
@@ -62,10 +61,6 @@ pub(crate) fn walk_collect_files(
                     return ignore::WalkState::Continue;
                 }
 
-                if !is_git_repo && is_known_binary_extension(path) {
-                    return ignore::WalkState::Continue;
-                }
-
                 let metadata = entry.metadata().ok();
                 let (file_item, rel_path) =
                     FileItem::new_from_walk(path, &base_path, None, metadata.as_ref());
@@ -77,8 +72,8 @@ pub(crate) fn walk_collect_files(
         })
     });
 
-    WalkOutput {
+    Ok(WalkOutput {
         pairs: pairs.into_inner(),
         ignore_rules: None,
-    }
+    })
 }

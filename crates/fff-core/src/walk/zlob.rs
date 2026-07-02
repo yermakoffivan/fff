@@ -1,36 +1,19 @@
 //! Filesystem traversal backed by zlob's native parallel walker.
 //! Active when the `zlob` feature is enabled (requires the Zig toolchain).
 
-use crate::background_watcher::is_git_file;
-use crate::file_picker::is_known_binary_extension;
-use crate::ignore::{NON_GIT_IGNORED_DIRS, PLATFORM_IGNORED_DIRS};
+use crate::file_picker::is_known_binary_extension_basename;
+use crate::ignore::IGNORED_DIRS;
 use crate::types::FileItem;
 use crate::walk::{WalkIgnoreRules, WalkOutput};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use zlob::walk::{IgnoreRules, WalkBuilder, WalkFlags, WalkMetadata, WalkResults};
+use zlob::walk::{WalkBuilder, WalkFlags, WalkMetadata, WalkState};
 
-/// Owns the walk storage so its ignore rules stay valid for the lifetime of
-/// the picker/watcher. `IgnoreRules` is a cheap re-derivable handle into this
-/// storage, so we re-fetch it per query instead of holding a self-reference.
-pub(crate) struct OwnedIgnoreRules {
-    results: WalkResults,
-}
-
-// WalkResults is Send + Sync; the derived handle only reads immutable storage.
-unsafe impl Send for OwnedIgnoreRules {}
-unsafe impl Sync for OwnedIgnoreRules {}
-
-impl OwnedIgnoreRules {
-    #[inline]
-    pub(crate) fn rules(&self) -> IgnoreRules<'_> {
-        // Safe to unwrap: only constructed when `ignore_rules()` was `Some`.
-        self.results
-            .ignore_rules()
-            .expect("ignore rules present for the retained walk results")
-    }
-}
+/// Publish the running file count every `PROGRESS_STEP` files so the UI's
+/// "Indexing files N" status animates live. Odd so the ticking looks less
+/// mechanical; the modulo is trivial next to the walk's syscall cost.
+const PROGRESS_STEP: usize = 13;
 
 /// Walk `base_path` and collect every non-ignored file as a
 /// `(FileItem, relative_path)` pair, plus the reusable ignore rules zlob
@@ -45,7 +28,7 @@ pub(crate) fn walk_collect_files(
     follow_symlinks: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
-) -> WalkOutput {
+) -> crate::Result<WalkOutput> {
     // gitignore on; skip hidden on non-git roots (so `~/` doesn't recurse into
     // ~/.cache, ~/.config, etc.); optionally follow symlinks.
     let mut flags = WalkFlags::GITIGNORE;
@@ -56,7 +39,10 @@ pub(crate) fn walk_collect_files(
         flags |= WalkFlags::FOLLOW_SYMLINKS;
     }
 
-    let mut builder = WalkBuilder::new(base_path);
+    // Constructing the builder is fallible in this zlob version (interior
+    // NUL in the path).
+    let mut builder = WalkBuilder::new(base_path)
+        .map_err(|e| crate::Error::WalkFailed(format!("WalkBuilder::new: {e:?}")))?;
     builder
         .options(flags)
         .threads(threads)
@@ -69,49 +55,27 @@ pub(crate) fn walk_collect_files(
     // from the project's own .gitignore, so we leave extra_ignore empty there.
     // The list must reach the walker as `extra_ignore` — filtering these
     // paths post-emit inside the visitor is what we're moving *away* from.
-    if !is_git_repo {
-        let extras: Vec<&str> = NON_GIT_IGNORED_DIRS
-            .iter()
-            .chain(PLATFORM_IGNORED_DIRS)
-            .copied()
-            .collect();
-        if !extras.is_empty() {
-            builder.extra_ignore(&extras);
-        }
+    if !is_git_repo
+        && !IGNORED_DIRS.is_empty()
+        && let Err(e) = builder.extra_ignore(IGNORED_DIRS)
+    {
+        // Interior NUL in one of the extra_ignore patterns would fail
+        // here — treat as if no extras were supplied rather than
+        // aborting the whole walk.
+        tracing::warn!(?e, "zlob extra_ignore rejected; walking without it");
     }
 
-    // `build()` materializes every entry lock-free in one FFI call (the fastest
-    // consumption path) and retains the assembled ignore rules for reuse.
-    let results = match builder.build() {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(?e, "zlob walk failed");
-            return WalkOutput {
-                pairs: Vec::new(),
-                ignore_rules: None,
-            };
-        }
-    };
+    let pairs = parking_lot::Mutex::new(Vec::<(FileItem, String)>::new());
 
-    // Convert entries -> (FileItem, rel_path). `WalkResults::iter` yields
-    // borrowed FFI entries that aren't `Send`, so build serially; the
-    // profiled cost is ~160 ms on a 500k-entry tree.
-    let mut pairs: Vec<(FileItem, String)> = Vec::with_capacity(results.len());
-    for entry in results.iter() {
+    let outcome = match builder.run(|entry| {
         if !entry.is_file() {
-            continue;
+            return WalkState::Continue;
         }
-        let path = entry.path();
+        let rel_bytes = entry.relative_path_bytes();
 
-        // zlob can surface files inside `.git/` when the base is itself a
-        // git repo — skip them.
-        if is_git_file(path) {
-            continue;
-        }
-
-        if !is_git_repo && is_known_binary_extension(path) {
-            continue;
-        }
+        // `basename()` returns `&str` for files only.
+        let basename = entry.basename().unwrap_or("");
+        let is_binary = is_known_binary_extension_basename(basename);
 
         let size = entry.size().unwrap_or(0);
         // zlob reports mtime in ns since the Unix epoch; FileItem wants secs.
@@ -120,21 +84,43 @@ pub(crate) fn walk_collect_files(
             .map(|ns| (ns / 1_000_000_000).max(0) as u64)
             .unwrap_or(0);
 
-        pairs.push(FileItem::new_from_walk_parts(
-            path, base_path, None, size, modified,
-        ));
-    }
+        let basename_offset = entry.basename_offset_in_relative();
+        let rel_str = String::from_utf8_lossy(rel_bytes).into_owned();
+        let item = FileItem::new_raw(basename_offset, size, modified, None, is_binary);
 
+        let mut guard = pairs.lock();
+        guard.push((item, rel_str));
+        let n = guard.len();
+        drop(guard);
+
+        if n % PROGRESS_STEP == 0 {
+            synced_files_count.store(n, Ordering::Relaxed);
+        }
+
+        WalkState::Continue
+    }) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // Preserve whatever we collected before the failure so the caller
+            // can still surface a partial index instead of nothing.
+            tracing::error!(?e, "zlob walk failed");
+            return Err(crate::Error::WalkFailed(format!("{e:?}")));
+        }
+    };
+
+    let pairs = pairs.into_inner();
+    // Always report the exact final total regardless of the last step.
     synced_files_count.store(pairs.len(), Ordering::Relaxed);
 
     // Retain the ignore rules only when the walk actually gathered some
     // (git roots with .gitignore/.ignore). Otherwise callers fall back.
-    let ignore_rules = results.ignore_rules().is_some().then(|| WalkIgnoreRules {
-        inner: OwnedIgnoreRules { results },
-    });
+    let ignore_rules = outcome
+        .rules()
+        .is_some()
+        .then(|| WalkIgnoreRules { inner: outcome });
 
-    WalkOutput {
+    Ok(WalkOutput {
         pairs,
         ignore_rules,
-    }
+    })
 }

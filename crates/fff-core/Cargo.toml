@@ -86,14 +86,3 @@ rand = { version = "0.8", features = ["small_rng"] }
 tempfile = "3.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[[example]]
-name = "walk_chromium"
-required-features = ["zlob"]
-
-[[example]]
-name = "walk_nongit_ab"
-required-features = ["zlob"]
-
-[[example]]
-name = "walk_breakdown"
-required-features = ["zlob"]
