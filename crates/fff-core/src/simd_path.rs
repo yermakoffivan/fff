@@ -103,7 +103,7 @@ impl ChunkedString {
         arena: ArenaPtr,
         buf: &'a mut [*const u8; 32],
     ) -> &'a [*const u8] {
-        let count = self.indices.len();
+        let count = self.indices.len().min(buf.len());
         let base = arena.as_ptr();
         for (i, &idx) in self.indices.iter().enumerate() {
             buf[i] = unsafe { base.add(idx as usize * SIMD_CHUNK_BYTES) };
