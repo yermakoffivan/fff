@@ -59,8 +59,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     # Long-running; don't let a stuck watcher thread burn a full CI
-    # timeout. Two scenarios should finish well under this limit.
-    timeout-minutes: 20
+    # timeout. Three stress steps take ~6min each (up to 2x slower on
+    # Windows with a cold cache), so leave generous headroom.
+    timeout-minutes: 45
     env:
       FFF_STRESS_CASES: "5"
       FFF_STRESS_MIN_OPS: "30"
