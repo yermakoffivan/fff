@@ -73,18 +73,12 @@ pub struct SharedFilePicker(pub(crate) Arc<SharedPickerInner>);
 
 pub struct SharedPickerInner {
     picker: parking_lot::RwLock<Option<FilePicker>>,
-    // Serializes every git-status read+apply (full rescans and per-path
-    // updates alike) so the two steps stay atomic as a unit. Without it a
-    // snapshot read from the pre-commit index can be applied *after* a
-    // post-commit one, leaving stale INDEX_* bits that never converge.
-    git_status_update: parking_lot::Mutex<()>,
 }
 
 impl Default for SharedPickerInner {
     fn default() -> Self {
         Self {
             picker: parking_lot::RwLock::new(None),
-            git_status_update: parking_lot::Mutex::new(()),
         }
     }
 }
@@ -223,13 +217,10 @@ impl SharedFilePicker {
         Ok(())
     }
 
-    /// Refresh git statuses for all indexed files.
+    /// Refresh git statuses for all indexed files
+    #[tracing::instrument(level = "info", skip_all)]
     pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
         use tracing::debug;
-
-        // Hold the serialization lock across the whole read+apply so no other
-        // status updater can interleave and clobber us with a stale snapshot.
-        let _serialize = self.0.git_status_update.lock();
 
         let git_status = {
             let git_root = {
@@ -267,10 +258,6 @@ impl SharedFilePicker {
     }
 
     /// Recompute and apply git status for a specific set of paths.
-    ///
-    /// Serialized against [`Self::refresh_git_status`] via the same lock and
-    /// waits for any in-flight `.git/index.lock` first, so it never reads a
-    /// half-written index mid-commit and never races a full rescan.
     pub fn update_git_status_for_paths(
         &self,
         paths: &[PathBuf],
@@ -279,8 +266,6 @@ impl SharedFilePicker {
         if paths.is_empty() {
             return Ok(());
         }
-
-        let _serialize = self.0.git_status_update.lock();
 
         let git_root = {
             let guard = self.read()?;
@@ -370,8 +355,7 @@ impl<T: LmdbStore> SharedDb<T> {
             *guard = Some(tracker);
         }
 
-        // GC holds a read guard on this lock, so destroy / re-init wait
-        // for it naturally — no join handle, no race against file removal.
+        // GC holds a read guard on this lock, so destroy / re-init wait won't race
         spawn_lmdb_gc(self.inner.clone());
         Ok(())
     }
@@ -382,8 +366,7 @@ impl<T: LmdbStore> SharedDb<T> {
     /// access) are finished before the LMDB environment is closed and the files
     /// are removed.
     ///
-    /// Returns `Ok(Some(path))` with the deleted path, or `Ok(None)` if no
-    /// tracker was initialized.
+    /// Returns `Ok(Some(path))` with the deleted path, or `Ok(None)` if no tracker was initialized.
     pub fn destroy(&self) -> Result<Option<PathBuf>, Error> {
         let mut guard = self.write()?;
         let Some(tracker) = guard.take() else {
