@@ -12,15 +12,63 @@ import {
   Text,
 } from "@earendil-works/pi-tui";
 import type {
+  FileFinderApi,
   GrepCursor,
   GrepMode,
   GrepResult,
+  InitOptions,
   MixedItem,
+  Result,
   SearchResult,
 } from "@ff-labs/fff-node";
-import { FileFinder } from "@ff-labs/fff-node";
 import { Type } from "@sinclair/typebox";
 import { buildQuery } from "./query";
+
+// Isomorphic SDK loading. pi hosts run under either bun (omp / oh-my-pi) or
+// node; the two SDKs implement the same FileFinderApi. Static imports of
+// @ff-labs/fff-node pull ffi-rs + optional native binaries into the module
+// graph, which trips oh-my-pi's static extension validator (issue #668). We
+// defeat static resolution with a variable-name dynamic import.
+type FileFinderStatic = {
+  create(options: InitOptions): Result<FileFinderApi>;
+};
+
+let sdkPromise: Promise<{ FileFinder: FileFinderStatic }> | null = null;
+
+function detectRuntime(): "bun" | "node" {
+  if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") return "bun";
+  if (
+    typeof process !== "undefined" &&
+    (process as { versions?: { bun?: string } }).versions?.bun
+  )
+    return "bun";
+  return "node";
+}
+
+function loadSdk(): Promise<{ FileFinder: FileFinderStatic }> {
+  if (sdkPromise) return sdkPromise;
+  const bunPkg = "@ff-labs/fff-bun";
+  const nodePkg = "@ff-labs/fff-node";
+  const preferred = detectRuntime() === "bun" ? bunPkg : nodePkg;
+  const fallback = preferred === bunPkg ? nodePkg : bunPkg;
+
+  sdkPromise = (async () => {
+    try {
+      return (await import(preferred)) as { FileFinder: FileFinderStatic };
+    } catch (e) {
+      try {
+        return (await import(fallback)) as { FileFinder: FileFinderStatic };
+      } catch {
+        throw new Error(
+          `pi-fff: neither ${preferred} nor ${fallback} could be loaded (${
+            e instanceof Error ? e.message : String(e)
+          })`,
+        );
+      }
+    }
+  })();
+  return sdkPromise;
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -277,13 +325,13 @@ function createFffMentionProvider(
 // ---------------------------------------------------------------------------
 
 export default function fffExtension(pi: ExtensionAPI) {
-  let finder: FileFinder | null = null;
+  let finder: FileFinderApi | null = null;
   let finderCwd: string | null = null;
   // Concurrent ensureFinder() callers share the same in-flight promise so
   // FileFinder.create() (which takes native DB locks) runs at most once per
   // base path at a time — otherwise parallel tool calls would race and
   // deadlock at the native layer (issue #403).
-  let finderPromise: Promise<FileFinder> | null = null;
+  let finderPromise: Promise<FileFinderApi> | null = null;
   let activeCwd = process.cwd();
 
   // Mode resolution: flag > env > default
@@ -331,7 +379,7 @@ export default function fffExtension(pi: ExtensionAPI) {
     return currentMode !== "tools-only";
   }
 
-  function ensureFinder(cwd: string): Promise<FileFinder> {
+  function ensureFinder(cwd: string): Promise<FileFinderApi> {
     if (finder && !finder.isDestroyed && finderCwd === cwd)
       return Promise.resolve(finder);
     if (finderPromise) return finderPromise;
@@ -343,6 +391,7 @@ export default function fffExtension(pi: ExtensionAPI) {
         finderCwd = null;
       }
 
+      const { FileFinder } = await loadSdk();
       const result = FileFinder.create({
         basePath: cwd,
         frecencyDbPath,
