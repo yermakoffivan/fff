@@ -288,8 +288,36 @@ export interface ScanProgress {
 }
 
 /**
- * Database health information
+ * Normalized watch event kind
+ * normalized means if some file was removed and created within 100ms it will be marked as modified
+ *
+ * rescan = internal OS buffers were overloaded, some events might be missing.
+ * The `path` is going to be a folder needs to be rescanned
  */
+export type WatchEventKind = "created" | "modified" | "removed" | "rescan";
+
+/** A single filesystem change notification. */
+export interface WatchEvent {
+  /** Absolute path of the affected file (base path to rescan if `kind ==rescan`) */
+  path: string;
+  kind: WatchEventKind;
+}
+
+/** Options for watch subscriptions. */
+export interface WatchOptions {
+  /** Additional glob wildcard patterns to ignore */
+  ignore?: string[];
+}
+
+/**
+ * Receives raw batches of up to 128 events. Duplicate paths may appear.
+ */
+export type WatchBatchCallback = (events: WatchEvent[]) => void;
+
+/** Call me to unsubscribe. */
+export type WatchUnsubscribe = () => void;
+
+/** Database health information */
 export interface DbHealth {
   /** Path to the database */
   path: string;
@@ -597,6 +625,30 @@ export interface FileFinderApi {
 
   /** Get a historical query by offset (0 = most recent). */
   getHistoricalQuery(offset: number): Result<string | null>;
+
+  /**
+   * Subscribe to filesystem changes matching `pattern`.
+   *
+   * Pattern semantics:
+   * - Wildcards (`*.rs`, `src/&#42;&#42;`, `./&#42;&#42;/&#42;.ts`) — glob matched against the
+   *   base-path-relative path. Absolute globs must be under the base path.
+   * - No wildcards — resolved against the base path (must stay inside it):
+   *   an existing directory subscribes to its whole subtree, anything else
+   *   is an exact file path.
+   * - Omitted — subscribes to the entire indexed tree: `watch(callback)`.
+   *
+   * The callback receives raw batches of up to 128 events; duplicate paths
+   * may appear. Unsubscribing takes
+   * effect synchronously: once it returns, the callback will not run again.
+   *
+   * Requires the instance to be created with watching enabled (default).
+   */
+  watch(callback: WatchBatchCallback, options?: WatchOptions): Result<WatchUnsubscribe>;
+  watch(
+    pattern: string,
+    callback: WatchBatchCallback,
+    options?: WatchOptions,
+  ): Result<WatchUnsubscribe>;
 
   /** Health/diagnostics information for this instance. */
   healthCheck(testPath?: string): Result<HealthCheck>;

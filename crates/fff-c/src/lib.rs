@@ -30,6 +30,7 @@ use fff::shared::SharedQueryTracker;
 
 mod accessors;
 mod ffi_types;
+mod watch;
 
 use fff::file_picker::FilePicker;
 use fff::frecency::FrecencyTracker;
@@ -50,12 +51,14 @@ struct FffInstance {
     picker: SharedFilePicker,
     frecency: SharedFrecency,
     query_tracker: SharedQueryTracker,
+    // we keep a single callback type
+    watch_callback: std::sync::Arc<watch::WatchCallbackSlot>,
 }
 
 /// Helper to convert C string to Rust &str.
 ///
 /// Returns `None` if the pointer is null or the string is not valid UTF-8.
-unsafe fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
+pub(crate) unsafe fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
     if s.is_null() {
         None
     } else {
@@ -73,7 +76,9 @@ unsafe fn optional_cstr<'a>(s: *const c_char) -> Option<&'a str> {
 /// Recover a `&FffInstance` from the opaque pointer.
 ///
 /// Returns an error `FffResult` if the pointer is null.
-unsafe fn instance_ref<'a>(fff_handle: *mut c_void) -> Result<&'a FffInstance, *mut FffResult> {
+pub(crate) unsafe fn instance_ref<'a>(
+    fff_handle: *mut c_void,
+) -> Result<&'a FffInstance, *mut FffResult> {
     if fff_handle.is_null() {
         Err(FffResult::err(
             "Instance handle is null. Create one with fff_create_instance first.",
@@ -304,6 +309,7 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
         picker: shared_picker,
         frecency: shared_frecency,
         query_tracker,
+        watch_callback: std::sync::Arc::new(watch::WatchCallbackSlot::default()),
     });
 
     let fff_handle = Box::into_raw(instance) as *mut c_void;
@@ -340,6 +346,10 @@ pub unsafe extern "C" fn fff_destroy(fff_handle: *mut c_void) {
     }
 
     let instance = unsafe { Box::from_raw(fff_handle as *mut FffInstance) };
+
+    // The C callback and user_data may be freed as soon as this returns.
+    instance.picker.shutdown_watches_and_wait();
+    instance.watch_callback.clear();
 
     if let Ok(mut guard) = instance.picker.write()
         && let Some(picker) = guard.take()

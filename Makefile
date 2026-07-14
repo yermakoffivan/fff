@@ -197,7 +197,7 @@ test-bun-compile: prepare-bun-packaged
 	rm -f packages/fff-bun/glob-bench-bin packages/fff-bun/glob-bench-bin.exe
 
 test-node: prepare-node
-	cd packages/fff-node && npm run build && node test/e2e.mjs
+	cd packages/fff-node && npm run build && node test/e2e.mjs && node test/watch.mjs
 
 test-js: test-bun test-node
 

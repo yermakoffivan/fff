@@ -26,12 +26,9 @@
 //! # Thread Safety
 //!
 //! `FilePicker` itself is **not** `Sync`!
-//! all concurrent access goes through [`SharedPicker`](crate::SharedPicker) .
-//! The background scanner and watcher acquire write locks only when mutating
-//! the file index, so read-heavy search workloads rarely contend.
+//! all concurrent access goes through [`crate::SharedFilePicker`]
 
 use crate::FFFStringStorage;
-use crate::background_watcher::BackgroundWatcher;
 use crate::constants::{MAX_OVERFLOW_FILES, PATH_BUF_SIZE};
 use crate::error::Error;
 use crate::frecency::FrecencyTracker;
@@ -48,6 +45,7 @@ use crate::types::{
     ContentCacheBudget, DirItem, DirSearchResult, FileItem, MixedItemRef, MixedSearchResult,
     PaginationArgs, Score, ScoringContext, SearchResult,
 };
+use crate::watch::BackgroundWatcher;
 use fff_query_parser::FFFQuery;
 use git2::{Repository, Status};
 use rayon::prelude::*;
@@ -98,7 +96,7 @@ pub(crate) struct FileSync {
     /// (parent_dir, filename):
     ///   `files[..indexable_count]` - indexable
     ///   `files[indexable_count..base_count]` - original-unindexable
-    ///   `files[base_count..]`— overflow (created on demand)
+    ///   `files[base_count..]` - overflow
     files: StableVec<FileItem>,
     indexable_count: usize,
     base_count: usize,
@@ -229,9 +227,6 @@ impl FileSync {
             .binary_search_by(|d| d.read_relative_path(arena, &mut dir_buf).cmp(dir_rel))
             .ok();
 
-        // Binary search base files by (parent_dir, filename). Base files live in
-        // two internally-sorted partitions — indexable first, then unindexable —
-        // so we try each half in turn. Two O(log n) searches with short-circuit.
         if let Some(dir_idx) = dir_idx {
             let dir_idx = dir_idx as u32;
             let cmp_key = |f: &FileItem| {
@@ -271,10 +266,11 @@ impl FileSync {
 
     // TODO remove this function and make a better way to remove all files
     // from the directory without looping over the whole sync data list
-    /// Tombstones every file in the arena that matches certain predicate
-    fn tombstone_files_with_arena<F>(&mut self, mut predicate: F) -> usize
+    // Tombstones every matching arena file.
+    fn tombstone_files_with_arena<F, T>(&mut self, mut predicate: F, mut on_tombstone: T) -> usize
     where
         F: FnMut(&FileItem, ArenaPtr) -> bool,
+        T: FnMut(&FileItem, ArenaPtr),
     {
         let base_arena = self.arena_base_ptr();
         let overflow_arena = self.arena_overflow_ptr();
@@ -291,6 +287,7 @@ impl FileSync {
                 overflow_arena
             };
             if predicate(file, arena) {
+                on_tombstone(file, arena);
                 file.set_deleted(true);
                 tombstoned += 1;
             }
@@ -441,24 +438,23 @@ impl FileItem {
 /// Options for creating a [`FilePicker`].
 pub struct FilePickerOptions {
     pub base_path: String,
-    /// Pre-populate mmap caches for top-frecency files after the initial scan.
+    /// Pre-populate mmap caches for top-frecency files after the initial scan
     pub enable_mmap_cache: bool,
-    /// Build content index after the initial scan for faster content-aware filtering.
+    /// Build content index after the initial scan for faster content-aware filtering
     pub enable_content_indexing: bool,
     /// Mode of the picker impact the way file watcher events are handled and the scoring logic
     pub mode: FFFMode,
     /// Explicit cache budget. When `None`, the budget is auto-computed from
     /// the repo size after the initial scan completes.
     pub cache_budget: Option<ContentCacheBudget>,
-    /// When `false`, `new_with_shared_state` skips the background file watcher.
+    /// When `false` no background watcher will be created
     pub watch: bool,
-    /// Follow symbolic links during file indexing.
+    /// Follow symbolic links during file indexing
     pub follow_symlinks: bool,
-    /// Allow indexing the filesystem root (`/`). Off by default — these dirs
-    /// generate enormous fs-event traffic and are rarely the intended target.
+    /// Allow indexing the filesystem root (`/`)
     pub enable_fs_root_scanning: bool,
     /// Allow indexing the user's home directory. Off by default for the same
-    /// reason as `enable_fs_root_scanning`.
+    /// reason as `enable_fs_root_scanning`
     pub enable_home_dir_scanning: bool,
 }
 
@@ -558,6 +554,10 @@ impl FilePicker {
 
     pub fn has_watcher(&self) -> bool {
         self.watch
+    }
+
+    pub fn is_watcher_ready(&self) -> bool {
+        self.background_watcher.is_some() && self.signals.watcher_ready.load(Ordering::Acquire)
     }
 
     pub fn follows_symlinks(&self) -> bool {
@@ -747,6 +747,17 @@ impl FilePicker {
             error!("Base path does not exist: {}", options.base_path);
             return Err(Error::InvalidPath(path));
         }
+        // Relative bases (".", "sub/dir") are resolved against the cwd so
+        // they can be compared with the absolute paths reported by the OS
+        // watcher. Purely lexical: no symlinks are resolved. The
+        // `components()` pass drops interior `.` segments ("/cwd/.").
+        let path = if path.is_relative() {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&path).components().collect())
+                .unwrap_or(path)
+        } else {
+            path
+        };
         if path.parent().is_none() && !options.enable_fs_root_scanning {
             error!("Refusing to index filesystem root: {}", path.display());
             return Err(Error::FilesystemRoot(path));
@@ -758,7 +769,7 @@ impl FilePicker {
             return Err(Error::FilesystemRoot(path));
         }
 
-        // Windows-only: canonicalize with so the base path does NOT
+        // Windows-only: canonicalize with dunce so the base path does NOT
         // have the `\\?\` UNC prefix that `std::fs::canonicalize` adds.
         // libgit2's `repo.workdir()`
         #[cfg(windows)]
@@ -830,6 +841,9 @@ impl FilePicker {
         signals
             .scanning
             .store(true, std::sync::atomic::Ordering::Release);
+
+        // Update the watch base before publishing the new picker.
+        shared_picker.rebase_watches(&path);
 
         {
             let mut guard = shared_picker.write()?;
@@ -1622,11 +1636,28 @@ impl FilePicker {
 
     // TODO make this O(n)
     pub fn remove_all_files_in_dir(&mut self, dir: impl AsRef<Path>) -> usize {
-        let dir_path = dir.as_ref();
-        let relative_dir = self
+        self.remove_all_files_in_dir_inner(dir.as_ref(), None)
+    }
+
+    pub(crate) fn remove_all_files_in_dir_with_paths(
+        &mut self,
+        dir: impl AsRef<Path>,
+        removed_paths: &mut Vec<PathBuf>,
+    ) -> usize {
+        self.remove_all_files_in_dir_inner(dir.as_ref(), Some(removed_paths))
+    }
+
+    fn remove_all_files_in_dir_inner(
+        &mut self,
+        dir_path: &Path,
+        mut removed_paths: Option<&mut Vec<PathBuf>>,
+    ) -> usize {
+        let Some(relative_dir) = self
             .to_relative_path(dir_path)
-            .map(|c| c.into_owned())
-            .unwrap_or_default();
+            .map(|path| path.into_owned())
+        else {
+            return 0;
+        };
 
         let dir_prefix = if relative_dir.is_empty() {
             String::new()
@@ -1635,9 +1666,19 @@ impl FilePicker {
             format!("{relative_dir}/")
         };
 
-        self.sync_data.tombstone_files_with_arena(|file, arena| {
-            file.relative_path_starts_with(arena, &dir_prefix)
-        })
+        let base_path = self.base_path.clone();
+        let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+        self.sync_data.tombstone_files_with_arena(
+            |file, arena| file.relative_path_starts_with(arena, &dir_prefix),
+            |file, arena| {
+                if let Some(paths) = removed_paths.as_deref_mut() {
+                    paths.push(
+                        file.write_absolute_path(arena, &base_path, &mut path_buf)
+                            .to_path_buf(),
+                    );
+                }
+            },
+        )
     }
 
     /// Use this to prevent any substantial background threads from acquiring the locks
@@ -1650,6 +1691,7 @@ impl FilePicker {
         if let Some(mut watcher) = self.background_watcher.take() {
             watcher.stop();
         }
+        self.signals.watcher_ready.store(false, Ordering::Release);
     }
 
     /// Quick way to check if scan is going without acquiring a lock for [Self::get_scan_progress]
@@ -2251,5 +2293,40 @@ mod tests {
         assert_eq!(common_dir_prefix_len("src", "src"), 0);
         // "src" is emitted-as-dir; "src/x" extends it — full "src" is shared.
         assert_eq!(common_dir_prefix_len("src", "src/x"), 3);
+    }
+
+    #[test]
+    fn directory_removal_collects_each_tombstoned_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let removed_dir = base.join("removed");
+        let kept = base.join("kept.txt");
+        let first = removed_dir.join("a.txt");
+        let second = removed_dir.join("nested/b.txt");
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(&first, b"a").unwrap();
+        std::fs::write(&second, b"b").unwrap();
+        std::fs::write(&kept, b"kept").unwrap();
+
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        let mut removed = Vec::new();
+        assert_eq!(
+            picker.remove_all_files_in_dir_with_paths(&removed_dir, &mut removed),
+            2
+        );
+        removed.sort_unstable();
+        assert_eq!(removed, vec![first, second]);
+        assert!(picker.get_file_by_path(&kept).is_some());
+
+        let outside = base.parent().unwrap().join("outside");
+        assert_eq!(picker.remove_all_files_in_dir(&outside), 0);
+        assert!(picker.get_file_by_path(&kept).is_some());
     }
 }

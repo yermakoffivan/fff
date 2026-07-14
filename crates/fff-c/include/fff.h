@@ -15,6 +15,11 @@
 #define FFF_CREATE_OPTIONS_VERSION 2
 
 /**
+ * Current version of [`FffWatchOptions`].
+ */
+#define FFF_WATCH_OPTIONS_VERSION 1
+
+/**
  * Result envelope returned by all `fff_*` functions.
  *
  * Heap-allocated. The caller must free it with `fff_free_result`. Calling `fff_free_result`
@@ -425,6 +430,55 @@ typedef struct FffMixedSearchResult {
    */
   struct FffLocation location;
 } FffMixedSearchResult;
+
+/**
+ * A single watch event.
+ *
+ * `kind`: 0 = created, 1 = modified, 2 = removed,
+ * 3 = rescan (events were lost; re-stat what you care about).
+ */
+typedef struct FffWatchEvent {
+  /**
+   * Absolute path (heap C string owned by the parent batch).
+   */
+  char *path;
+  uint8_t kind;
+} FffWatchEvent;
+
+/**
+ * A batch of watch events. Free with `fff_free_watch_events`.
+ */
+typedef struct FffWatchEventBatch {
+  struct FffWatchEvent *events;
+  uint32_t count;
+} FffWatchEventBatch;
+
+/**
+ * Instance-wide callback invoked with `(watch_id, batch)` for every
+ * subscription created by `fff_watch`. See the module docs for the
+ * ownership contract: the callee frees `batch` with `fff_free_watch_events`.
+ */
+typedef void (*FffWatchCallback)(uint64_t watch_id,
+                                 struct FffWatchEventBatch *batch,
+                                 void *user_data);
+
+/**
+ * Options for `fff_watch`. Versioned: new fields are only appended,
+ * callers set `version` to the version they were built for.
+ */
+typedef struct FffWatchOptions {
+  /**
+   * Set to [`FFF_WATCH_OPTIONS_VERSION`] when allocating.
+   */
+  uint32_t version;
+  /**
+   * Per-subscription excludes (parcel-watcher style): entries with
+   * wildcards are globs against the base-relative path, entries without
+   * are path prefixes. NULL when `ignore_count` is 0.
+   */
+  const char *const *ignore;
+  uint32_t ignore_count;
+} FffWatchOptions;
 
 /**
  * Create a new file finder instance (legacy 8-arg positional signature).
@@ -1383,5 +1437,84 @@ uint32_t fff_grep_result_get_next_file_offset(const struct FffGrepResult *r);
  * `r` must be a valid `FffGrepResult` pointer or null.
  */
 const char *fff_grep_result_get_regex_fallback_error(const struct FffGrepResult *r);
+
+/**
+ * Register the instance-wide watch callback used by all `fff_watch`
+ * subscriptions. Call once before the first `fff_watch`; calling again
+ * replaces the callback for subsequent deliveries.
+ *
+ * The callback runs on fff's dedicated callback thread. It must be
+ * thread-safe and must free each batch with `fff_free_watch_events`.
+ *
+ * ## Safety
+ * * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
+ * * `callback` must remain callable — and `user_data` valid — until
+ *   `fff_destroy(fff_handle)` returns.
+ */
+struct FffResult *fff_set_watch_callback(void *fff_handle,
+                                         FffWatchCallback callback,
+                                         void *user_data);
+
+/**
+ * Subscribe to filesystem changes with delivery through the instance
+ * callback registered by `fff_set_watch_callback`.
+ *
+ * `pattern` semantics: wildcards = base-relative glob (e.g. `*.rs` or a
+ * subtree glob like `src` + `/` + `**`); no wildcards = path inside the
+ * indexed tree — an existing directory subscribes to its whole subtree
+ * (parcel-watcher style), anything else is an exact file path.
+ * NULL (or an empty string) subscribes to the entire indexed tree.
+ * `opts.ignore` filters matches out.
+ *
+ * Returns the watch id in `int_value`; pass it to `fff_unwatch` to stop.
+ * Note: delivery for a new subscription may begin before this function
+ * returns — route by `watch_id` and treat unknown ids as benign.
+ *
+ * ## Safety
+ * * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
+ * * `pattern` must be NULL or valid null-terminated UTF-8.
+ * * `opts` must be NULL or a valid `FffWatchOptions` pointer.
+ */
+struct FffResult *fff_watch(void *fff_handle,
+                            const char *pattern,
+                            const struct FffWatchOptions *opts);
+
+/**
+ * Calling-convention adapter for [`fff_watch`] with flattened options.
+ *
+ * For FFI libraries that cannot marshal pointer arrays inside structs
+ * (e.g. Node's `ffi-rs`, which supports string arrays only as top-level
+ * parameters). Semantics are identical to `fff_watch` with an
+ * [`FffWatchOptions`] carrying the same values.
+ *
+ * ## Safety
+ * * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
+ * * `pattern` must be NULL (watch everything) or valid null-terminated UTF-8.
+ * * `ignore` must be NULL or point to `ignore_count` valid C strings.
+ */
+struct FffResult *fff_watch_args(void *fff_handle,
+                                 const char *pattern,
+                                 const char *const *ignore,
+                                 uint32_t ignore_count);
+
+/**
+ * Remove a watch subscription. `int_value` = 1 if the id existed, 0 otherwise.
+ *
+ * Non-blocking: a batch already being dispatched may still reach the
+ * instance callback (with this id) after this returns — treat it as a
+ * lookup miss. The hard "never again" point is `fff_destroy`.
+ *
+ * ## Safety
+ * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
+ */
+struct FffResult *fff_unwatch(void *fff_handle, uint64_t watch_id);
+
+/**
+ * Free a watch event batch delivered to the instance callback.
+ *
+ * ## Safety
+ * `batch` must be a pointer produced by this library, or null (no-op).
+ */
+void fff_free_watch_events(struct FffWatchEventBatch *batch);
 
 #endif  /* FFF_C_H */

@@ -4,6 +4,7 @@ use crate::file_picker::FFFMode;
 use crate::git_status_worker::GitStatusWorker;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
+use crate::watch::{RawWatchEvent, WatchEventKind};
 use git2::Repository;
 use notify::event::{AccessKind, AccessMode};
 use notify::{Config, EventKind, EventKindMask, RecursiveMode};
@@ -26,17 +27,13 @@ pub struct BackgroundWatcher {
 }
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(50);
-/// On macOS, each `watch()` call creates a separate FSEventStream. When the
-/// number of directories exceeds this threshold we fall back to a single
-/// recursive watch to avoid exhausting the per-process stream limit.
-const MAX_MACOS_NONRECURSIVE_WATCHES: usize = 4096;
 /// Minimum seconds between frecency tracks of the same file in AI mode.
 /// Prevents score inflation from rapid burst edits by AI agents.
 const AI_MODE_COOLDOWN_SECS: u64 = 5 * 60;
 
 impl BackgroundWatcher {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         base_path: PathBuf,
         git_workdir: Option<PathBuf>,
         shared_picker: SharedFilePicker,
@@ -100,7 +97,6 @@ impl BackgroundWatcher {
 
         info!("Background file watcher initialized successfully");
 
-        // debouncer is shared with the owner thread, once it's dropped the thread is closed
         let debouncer = Arc::new(Mutex::new(Some(debouncer)));
         // Only the Linux per-dir-watch branch needs this clone; on other
         // platforms the owner thread never touches the debouncer.
@@ -179,9 +175,6 @@ impl BackgroundWatcher {
         git_status_worker: Arc<GitStatusWorker>,
     ) -> Result<Debouncer, Error> {
         let config = Config::default()
-            // do not follow symlinks as then notifiers spawns a bunch of events for symlinked
-            // files that could be git ignored, we have to property differentiate those and if
-            // the file was edited through a
             .with_follow_symlinks(false)
             // only the actual modification events, ignore the open syscals that we can generate by
             // our own grep calls and preview window rendering
@@ -232,13 +225,10 @@ impl BackgroundWatcher {
         )?;
 
         if use_recursive {
-            // if the platform supports native watcher recursion
             debouncer.watch(base_path.as_path(), RecursiveMode::Recursive)?;
             info!(
-                "File watcher initialized with single recursive watch on {} \
-                 (exceeded threshold of {})",
+                "File watcher initialized with single recursive watch on {}",
                 base_path.display(),
-                MAX_MACOS_NONRECURSIVE_WATCHES,
             );
         } else {
             debouncer.watch(base_path.as_path(), RecursiveMode::NonRecursive)?;
@@ -298,7 +288,9 @@ impl BackgroundWatcher {
         Ok(debouncer)
     }
 
-    /// Signals the background watcher threads to shut down, doesn't guarantee to deallocate immediately
+    /// Signal the watcher to shut down without blocking on its worker
+    /// threads. Safe to call from any context, including while holding
+    /// the [`SharedFilePicker`] write lock.
     pub fn stop(&mut self) {
         self.watch_tx.take();
         if let Some(debouncer) = self.debouncer.lock().take() {
@@ -351,6 +343,11 @@ fn handle_debounced_events(
     let mut new_dirs_to_watch = Vec::new();
     let mut affected_paths_count = 0usize;
 
+    // Capture raw events for watch subscriptions only when someone listens.
+    let watch_registry = shared_picker.watch_registry();
+    let capture_watch_events = watch_registry.is_active();
+    let mut watch_events: Vec<RawWatchEvent> = Vec::new();
+
     for debounced_event in &events {
         // It is very important to not react to the access errors because we inevitably
         // gonna trigger the sync by our own preview or other unnecessary noise
@@ -373,7 +370,7 @@ fn handle_debounced_events(
                     .paths
                     .iter()
                     // but we are smart enough and not falling into the paths
-                    .all(|p| should_include_file(p, &filter))
+                    .all(|p| !p.is_dir() && !filter.is_ignored(p))
             {
                 break;
             }
@@ -431,19 +428,47 @@ fn handle_debounced_events(
                 EventKind::Remove(notify::event::RemoveKind::Folder)
             );
 
+            let is_removed = is_folder_removal || is_removal || !path.exists();
+
+            // Statted once, shared by the watch capture and the index update
+            // (the ignore-rules walk is the expensive part). Ignore rules
+            // stat the path, so they misreport deleted files: removals start
+            // as "ignored" and are re-marked visible after the index confirms
+            // it actually held the file (index presence == never ignored).
+            let (is_dir, is_ignored) = if is_removed {
+                (false, true)
+            } else {
+                (path.is_dir(), filter.is_ignored(path))
+            };
+
+            if capture_watch_events {
+                let kind = if is_removed {
+                    WatchEventKind::Removed
+                } else if matches!(debounced_event.event.kind, EventKind::Create(_)) {
+                    WatchEventKind::Created
+                } else {
+                    WatchEventKind::Modified
+                };
+                if is_removed || (!is_dir && !is_ignored) {
+                    watch_events.push(RawWatchEvent {
+                        path: path.to_path_buf(),
+                        kind,
+                        is_ignored,
+                    });
+                }
+            }
+
             if is_folder_removal {
                 dirs_to_remove.push(path.to_path_buf());
-            } else if is_removal || !path.exists() {
+            } else if is_removed {
                 paths_to_remove.push(path.as_path());
-            } else if path.is_dir() {
-                if !is_path_ignored(path, &filter) {
+            } else if is_dir {
+                if !is_ignored {
                     new_dirs_to_watch.push(path.to_path_buf());
                 }
-            } else {
+            } else if !is_ignored {
                 // For additions/modifications, still filter gitignored files.
-                if should_include_file(path, &filter) {
-                    paths_to_add_or_modify.push(path.as_path());
-                }
+                paths_to_add_or_modify.push(path.as_path());
             }
         }
 
@@ -466,6 +491,7 @@ fn handle_debounced_events(
 
     if need_full_rescan {
         info!(?affected_paths_count, "Triggering full rescan");
+        watch_registry.dispatch_rescan(base_path);
         if let Err(e) = shared_picker.trigger_full_rescan_async(shared_frecency) {
             error!("Failed to trigger full rescan: {:?}", e);
         }
@@ -498,6 +524,10 @@ fn handle_debounced_events(
     let mut files_to_update_git_status = Vec::new();
     let mut need_full_rescan = false;
     let mut overflow_count = 0;
+    let mut removed_from_dirs = Vec::new();
+    // Removals confirmed by the index; used to mark Removed watch events as
+    // non-ignored (a file the index held was by definition not ignored).
+    let mut confirmed_removed: ahash::AHashSet<PathBuf> = ahash::AHashSet::new();
 
     if !paths_to_remove.is_empty()
         || !dirs_to_remove.is_empty()
@@ -520,13 +550,23 @@ fn handle_debounced_events(
         };
 
         for dir in &dirs_to_remove {
-            let count = picker.remove_all_files_in_dir(dir);
+            let count = if capture_watch_events {
+                picker.remove_all_files_in_dir_with_paths(dir, &mut removed_from_dirs)
+            } else {
+                picker.remove_all_files_in_dir(dir)
+            };
             debug!("remove_all_files_in_dir({:?}) -> {} files", dir, count);
+            if capture_watch_events && count > 0 {
+                confirmed_removed.insert(dir.clone());
+            }
         }
 
         for path in &paths_to_remove {
             let removed = picker.remove_file_by_path(path);
             debug!("remove_file_by_path({:?}) -> {}", path, removed);
+            if capture_watch_events && removed {
+                confirmed_removed.insert(path.to_path_buf());
+            }
         }
 
         files_to_update_git_status.reserve(paths_to_add_or_modify.len());
@@ -545,8 +585,24 @@ fn handle_debounced_events(
         files_updated = files_to_update_git_status.len(),
         overflow_count, "File index changes applied",
     );
+
+    if capture_watch_events {
+        watch_events.extend(removed_from_dirs.into_iter().map(|path| RawWatchEvent {
+            path,
+            kind: WatchEventKind::Removed,
+            is_ignored: false,
+        }));
+        for ev in &mut watch_events {
+            if ev.kind == WatchEventKind::Removed && confirmed_removed.contains(&ev.path) {
+                ev.is_ignored = false;
+            }
+        }
+        watch_registry.dispatch(base_path, watch_events);
+    }
+
     if need_full_rescan || overflow_count > MAX_OVERFLOW_FILES {
         info!("Watcher faced limit of index overflow. Triggering rescan");
+        watch_registry.dispatch_rescan(base_path);
         if let Err(e) = shared_picker.trigger_full_rescan_async(shared_frecency) {
             error!("Failed to trigger full rescan: {:?}", e);
         }
@@ -639,7 +695,8 @@ fn track_files_from_new_directories(
     for entry in entries.flatten() {
         if entry.file_type().is_ok_and(|ft| ft.is_file()) {
             let path = entry.path();
-            if should_include_file(&path, &filter) {
+            // file_type() already ruled out directories — only ignore rules left
+            if !filter.is_ignored(&path) {
                 files_to_add.push(path);
             }
         }
@@ -649,8 +706,7 @@ fn track_files_from_new_directories(
         return;
     }
 
-    let added = files_to_add.len();
-
+    let mut indexed_files = Vec::with_capacity(files_to_add.len());
     {
         let Ok(mut guard) = shared_picker.write() else {
             return;
@@ -661,12 +717,29 @@ fn track_files_from_new_directories(
         };
 
         for path in &files_to_add {
-            picker.handle_create_or_modify(path);
+            if picker.handle_create_or_modify(path).is_some() {
+                indexed_files.push(path.clone());
+            }
         }
+    }
+    let added = indexed_files.len();
+
+    let watch_registry = shared_picker.watch_registry();
+    if watch_registry.is_active() {
+        let events = indexed_files
+            .iter()
+            .map(|path| RawWatchEvent {
+                path: path.clone(),
+                kind: WatchEventKind::Created,
+                is_ignored: false,
+            })
+            .collect();
+
+        watch_registry.dispatch(&base_path, events);
     }
 
     if repo.is_some() {
-        git_status_worker.enqueue_paths(files_to_add);
+        git_status_worker.enqueue_paths(indexed_files);
     }
 
     debug!(
@@ -674,19 +747,6 @@ fn track_files_from_new_directories(
         added,
         dir.display(),
     );
-}
-
-fn should_include_file(path: &Path, filter: &IgnoreFilter) -> bool {
-    // Directories are not indexed — only regular files (and symlinks to files).
-    if path.is_dir() {
-        return false;
-    }
-    !filter.is_ignored(path)
-}
-
-#[inline]
-fn is_path_ignored(path: &Path, filter: &IgnoreFilter) -> bool {
-    filter.is_ignored(path)
 }
 
 struct IgnoreFilter<'a> {
@@ -724,8 +784,12 @@ impl<'a> IgnoreFilter<'a> {
         }
         match self.repo {
             Some(repo) => repo.is_path_ignored(path) == Ok(true),
-            // No repo and no rules: fall back to the non-code-dir heuristic.
-            None => crate::ignore::is_non_code_directory(path),
+            // No repo and no rules: the non-code-dir heuristic, applied to the
+            // base-relative path so ancestors of the base (e.g. a temp dir
+            // under AppData/Local on Windows) never match.
+            None => crate::ignore::is_non_code_directory(
+                path.strip_prefix(self.base_path).unwrap_or(path),
+            ),
         }
     }
 }
