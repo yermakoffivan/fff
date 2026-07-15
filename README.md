@@ -4,8 +4,6 @@
   <i>A file search toolkit for humans and AI agents. Really fast.</i>
 </p>
 
-<sub><b>FFF</b> — pick your favourite: <b>F</b>ast <b>F</b>ile <b>F</b>inder, <b>F</b>uzzy <b>F</b>ile <b>F</b>inder, or will search <b>F</b>iles <b>F</b>or <b>F</b>ood. Brand hex is <code>#F87216</code>, not <code>#FFF</code>. Logo variants: <a href="./assets/logo-orange.png">orange</a> · <a href="./assets/logo-dark.png">dark</a> · <a href="./assets/logo-light.png">light</a>.</sub>
-
 Typo-resistant path and content search, frecency-ranked file access, a background watcher, and a lightweight in-memory content index. Way faster than CLIs like ripgrep and fzf in any long-running process that searches more than once.
 
 Powers file search in [opencode](http://github.com/anomalyco/opencode/), [nushell](https://github.com/nushell/nushell), and many more amazing projects!
@@ -826,3 +824,15 @@ Bug reports and pull requests welcome. Agentic coding tools are welcome to be us
 ## License
 
 [MIT](./LICENSE) & open source forever.
+
+## FAQ
+
+### What does FFF stand for?
+
+There is intentionally no single canonical definition. Pick your favourite:
+
+- **F**ast **F**ile **F**inder
+- **F**uzzy **F**ile **F**inder
+- will search **F**iles **F**or **F**ood
+
+The brand hex is `#F87216`, not `#FFF`. Logo variants: [orange](./assets/logo-orange.png) · [dark](./assets/logo-dark.png) · [light](./assets/logo-light.png).
