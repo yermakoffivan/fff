@@ -1321,6 +1321,33 @@ struct FffResult *fff_watch_args(void *fff_handle,
 struct FffResult *fff_unwatch(void *fff_handle, uint64_t watch_id);
 
 /**
+ * Number of events in a batch; 0 if `batch` is null.
+ *
+ * ## Safety
+ * `batch` must be a valid `FffWatchEventBatch` pointer or null.
+ */
+uint32_t fff_watch_events_count(const struct FffWatchEventBatch *batch);
+
+/**
+ * Absolute path of event `index`, will be null when out of bounds
+ *
+ * ## Safety
+ * `batch` must be a valid `FffWatchEventBatch` pointer or null.
+ */
+const char *fff_watch_events_get_path(const struct FffWatchEventBatch *batch, uint32_t index);
+
+/**
+ * Kind of event `index` (0 = created, 1 = modified, 2 = removed, 3 = rescan)
+ * 3 (rescan aka "re-stat something" kind) returned when OS based buffer
+ * has been overflown and some events might be loss. Paths will contain a list of
+ * directories that needs to be rescanned to ensure consistency.
+ *
+ * ## Safety
+ * `batch` must be a valid `FffWatchEventBatch` pointer or null.
+ */
+uint8_t fff_watch_events_get_kind(const struct FffWatchEventBatch *batch, uint32_t index);
+
+/**
  * Free a watch event batch delivered to the instance callback.
  *
  * ## Safety

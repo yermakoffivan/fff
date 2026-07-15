@@ -437,7 +437,13 @@ fn handle_debounced_events(
             if is_folder_removal {
                 dirs_to_remove.push(path.to_path_buf());
             } else if is_removed {
-                paths_to_remove.push(path.as_path());
+                // best effort but doesn't require a stat and generally correct
+                let maybe_directory = !matches!(
+                    debounced_event.event.kind,
+                    EventKind::Remove(notify::event::RemoveKind::File)
+                );
+
+                paths_to_remove.push((path.as_path(), maybe_directory));
             } else if is_dir {
                 if !is_ignored {
                     new_dirs_to_watch.push(path.to_path_buf());
@@ -523,27 +529,37 @@ fn handle_debounced_events(
             return new_dirs_to_watch;
         };
 
-        for dir in &dirs_to_remove {
+        for (path, may_be_dir) in &paths_to_remove {
+            let removed = picker.remove_file_by_path(path);
+
+            if removed {
+                if need_events_propagation {
+                    watch_events.insert(path.to_path_buf(), WatchEventKind::Removed);
+                }
+            } else if *may_be_dir {
+                // Not an indexed file: likely a dir renamed out of the tree
+                // (no Remove(Folder) is emitted), expand it per indexed file.
+                dirs_to_remove.push(path.to_path_buf());
+            }
+        }
+
+        // Single index scan for all dirs; misses (never-indexed paths) are free.
+        dirs_to_remove.sort_unstable();
+        dirs_to_remove.dedup();
+        if !dirs_to_remove.is_empty() {
+            let dirs = dirs_to_remove.iter().map(PathBuf::as_path);
             if need_events_propagation {
-                picker.remove_all_files_in_dir_with_callback(dir, |path| {
+                picker.remove_all_files_in_dirs_with_callback(dirs, |path| {
                     removed_from_dirs.push(path.to_path_buf());
                 })
             } else {
-                picker.remove_all_files_in_dir(dir)
+                picker.remove_all_files_in_dirs(dirs)
             };
         }
 
         if need_events_propagation {
             for path in removed_from_dirs.drain(..) {
                 watch_events.insert(path, WatchEventKind::Removed);
-            }
-        }
-
-        for path in &paths_to_remove {
-            let removed = picker.remove_file_by_path(path);
-
-            if need_events_propagation && removed {
-                watch_events.insert(path.to_path_buf(), WatchEventKind::Removed);
             }
         }
 

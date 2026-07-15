@@ -206,6 +206,75 @@ fn watch_events_reflect_applied_file_transitions() {
 }
 
 #[test]
+fn removed_directory_delivers_removed_event_per_file() {
+    let tmp = TempDir::new().unwrap();
+    let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    seed(&base);
+    let dir = base.join("doomed");
+    fs::create_dir_all(dir.join("nested")).unwrap();
+    let files = [dir.join("a.rs"), dir.join("b.txt"), dir.join("nested/c.rs")];
+    for f in &files {
+        fs::write(f, "content\n").unwrap();
+    }
+
+    let (picker, _frecency) = make_watched_picker(&base);
+    let events = watch_collect(&picker, "", WatchOptions::default());
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(
+        wait_for(
+            || {
+                let got = events.lock();
+                files.iter().all(|f| {
+                    got.iter()
+                        .any(|e| e.path == *f && e.kind == WatchEventKind::Removed)
+                })
+            },
+            Duration::from_secs(10)
+        ),
+        "expected Removed for every file in the removed dir, got: {:?}",
+        events.lock()
+    );
+}
+
+#[test]
+fn moved_out_directory_delivers_removed_event_per_file() {
+    let tmp = TempDir::new().unwrap();
+    let trash = TempDir::new().unwrap();
+    let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    seed(&base);
+    let dir = base.join("doomed");
+    fs::create_dir_all(dir.join("nested")).unwrap();
+    let files = [dir.join("a.rs"), dir.join("b.txt"), dir.join("nested/c.rs")];
+    for f in &files {
+        fs::write(f, "content\n").unwrap();
+    }
+
+    let (picker, _frecency) = make_watched_picker(&base);
+    let events = watch_collect(&picker, "", WatchOptions::default());
+
+    // mimics `mv dir elsewhere` / Finder trash: one rename event on the dir,
+    // no per-file remove events from the OS
+    fs::rename(&dir, trash.path().join("doomed")).unwrap();
+
+    assert!(
+        wait_for(
+            || {
+                let got = events.lock();
+                files.iter().all(|f| {
+                    got.iter()
+                        .any(|e| e.path == *f && e.kind == WatchEventKind::Removed)
+                })
+            },
+            Duration::from_secs(10)
+        ),
+        "expected Removed for every file in the moved-out dir, got: {:?}",
+        events.lock()
+    );
+}
+
+#[test]
 fn empty_pattern_watches_the_whole_tree() {
     let tmp = TempDir::new().unwrap();
     let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
@@ -397,6 +466,36 @@ fn shutdown_watches_stops_future_deliveries() {
         calls.load(Ordering::SeqCst),
         after,
         "callback fired after shutdown_watches returned"
+    );
+}
+
+#[test]
+fn non_canonical_dir_pattern_resolves_into_the_tree() {
+    let tmp = TempDir::new().unwrap();
+    let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    seed(&base);
+    let (picker, _) = make_watched_picker(&base);
+
+    // tmp.path() is the non-canonical spelling (e.g. /var/... symlinked to
+    // /private/var/... on macOS, 8.3 short names on Windows); the watch must
+    // canonicalize instead of rejecting it
+    let events = watch_collect(
+        &picker,
+        tmp.path().to_str().unwrap(),
+        WatchOptions::default(),
+    );
+
+    fs::write(base.join("via-alias.txt"), "x\n").unwrap();
+    assert!(
+        wait_for(
+            || events
+                .lock()
+                .iter()
+                .any(|e| e.path == base.join("via-alias.txt")),
+            Duration::from_secs(10)
+        ),
+        "non-canonical base-dir pattern must receive events, got {:?}",
+        events.lock()
     );
 }
 

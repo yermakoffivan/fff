@@ -116,17 +116,36 @@ impl SubIgnore {
 fn relative_pattern(pattern: &str, base: &Path) -> Option<PathBuf> {
     let expanded = crate::path_utils::expand_tilde(pattern);
     let relative = if expanded.is_absolute() || expanded.has_root() {
-        expanded.strip_prefix(base).ok()?
+        match expanded.strip_prefix(base) {
+            Ok(rel) => rel,
+            // Windows: the caller may pass an 8.3 short-name or differently
+            // cased path; canonicalize and retry before rejecting.
+            Err(_) => {
+                let canonical = crate::path_utils::canonicalize(&expanded).ok()?;
+                return relative_from_canonical(&canonical, base);
+            }
+        }
     } else {
         &expanded
     };
-    if relative
+
+    reject_parent_components(relative)
+}
+
+fn relative_from_canonical(canonical: &Path, base: &Path) -> Option<PathBuf> {
+    let relative = canonical.strip_prefix(base).ok()?;
+    reject_parent_components(relative)
+}
+
+fn reject_parent_components(path: &Path) -> Option<PathBuf> {
+    if path
         .components()
         .any(|component| component == std::path::Component::ParentDir)
     {
         return None;
     }
-    Some(relative.components().collect())
+
+    Some(path.components().collect())
 }
 
 fn resolve_sub_ignore(patterns: &[String], base: &Path) -> Result<SubIgnore, Error> {

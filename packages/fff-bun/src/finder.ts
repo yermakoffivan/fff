@@ -613,7 +613,13 @@ export class FileFinder implements FileFinderApi {
         }
       },
       {
-        args: [FFIType.u64, FFIType.ptr, FFIType.ptr],
+        // an attempt to fix the bug that is kept unfixed in the zig version of bun :()
+        // https://github.com/oven-sh/bun/issues/33840:
+        //
+        // watch_id is declared `ptr`, not `u64`: ABI-identical (one 64-bit
+        // register), but u64 args make bun allocate a JSBigInt on the CALLING
+        // (non-JS) thread, corrupting the JS heap
+        args: [FFIType.ptr, FFIType.ptr, FFIType.ptr],
         returns: FFIType.void,
         threadsafe: true,
       },

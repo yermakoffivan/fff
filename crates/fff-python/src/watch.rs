@@ -4,11 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use fff::{SharedFilePicker, WatchId};
 use pyo3::prelude::*;
 
-/// Handle for an active watch subscription returned by `FileFinder.watch`.
+/// Handle for an active watch subscription returned by [crate::FileFinder::watch]
 ///
-/// Usable as a context manager: exiting the `with` block unsubscribes.
-/// Subscriptions also die with the picker, so `FileFinder.close()` makes an
-/// explicit `unsubscribe()` unnecessary (but still safe).
+/// Usable as a context manager: exiting the `with` block unsubscribes
 #[pyclass]
 pub struct WatchSubscription {
     picker: SharedFilePicker,
@@ -38,10 +36,6 @@ impl WatchSubscription {
 
     /// Stop delivering events. Idempotent: returns True when the subscription
     /// was removed by this call, False if it was already inactive.
-    ///
-    /// Non-blocking and safe to call from inside the callback itself. The
-    /// user callback is guaranteed to not be invoked for this subscription
-    /// after this returns (a callback already executing may finish).
     fn unsubscribe(&self) -> bool {
         if !self.active.swap(false, Ordering::AcqRel) {
             return false;

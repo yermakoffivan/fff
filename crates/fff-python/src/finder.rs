@@ -743,22 +743,11 @@ impl FileFinder {
 
     /// Subscribe to filesystem changes matching `pattern`.
     ///
-    /// Pattern semantics: wildcards (`*.rs`, `src/**`) form a glob matched
-    /// against the base-path-relative path; a pattern without wildcards
-    /// resolves inside the indexed tree — an existing directory subscribes
-    /// to its whole subtree (parcel-watcher style), anything else is an
-    /// exact file path. `None` subscribes to the entire indexed tree.
-    /// `ignore` entries exclude matches per subscription (globs or path
-    /// prefixes).
+    /// Patterns may be base-relative globs (./ works), exact paths inside the indexed
+    /// tree, or existing directories. An empty pattern watches the whole tree.
     ///
-    /// `callback` receives normalized batches of up to 128 events on a
-    /// dedicated callback thread. Each path appears at most once. An event
-    /// with kind `"rescan"` means events were lost and the consumer should re-stat.
-    /// Callback exceptions are reported via `sys.unraisablehook` and never
-    /// propagate. Requires the finder to be created with `watch=True`.
-    ///
-    /// Subscriptions die with the picker: `close()` invalidates them without
-    /// an explicit `unsubscribe()`.
+    /// Events are debounced and submitted in batches per 100-ms window at most 128 events.
+    /// Gitignored and other ignored files are never triggering watcher.
     #[pyo3(signature = (pattern, callback, *, ignore = None))]
     fn watch(
         &self,

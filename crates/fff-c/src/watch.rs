@@ -1,14 +1,3 @@
-//! C FFI for filesystem watch subscriptions.
-//!
-//! Delivery model: ONE callback per instance (`fff_set_watch_callback`) shared
-//! by every `fff_watch` subscription; it receives `(watch_id, batch)` on fff's
-//! callback thread and clients route by id. Batch ownership transfers to the
-//! callee, which MUST free it with `fff_free_watch_events` (possibly later /
-//! on another thread). Batches hold at most 128 events, each path once.
-//! Callback + `user_data` must stay valid until `fff_destroy` returns, which
-//! waits for in-flight invocations. `fff_unwatch` is non-blocking: one batch
-//! already dispatching may still arrive after it returns.
-
 use std::ffi::{CString, c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
@@ -252,6 +241,65 @@ pub unsafe extern "C" fn fff_unwatch(fff_handle: *mut c_void, watch_id: u64) -> 
         Err(e) => return e,
     };
     FffResult::ok_int(inst.picker.unwatch(WatchId(watch_id)) as i64)
+}
+
+/// Number of events in a batch, 0 if `batch` is null.
+///
+/// ## Safety
+/// `batch` must be a valid `FffWatchEventBatch` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_watch_events_count(batch: *const FffWatchEventBatch) -> u32 {
+    if batch.is_null() {
+        return 0;
+    }
+    unsafe { (*batch).count }
+}
+
+/// Absolute path of event `index`, will be null when out of bounds
+///
+/// ## Safety
+/// `batch` must be a valid `FffWatchEventBatch` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_watch_events_get_path(
+    batch: *const FffWatchEventBatch,
+    index: u32,
+) -> *const c_char {
+    match unsafe { watch_event_at(batch, index) } {
+        Some(ev) => ev.path,
+        None => ptr::null(),
+    }
+}
+
+/// Kind of event `index` (0 = created, 1 = modified, 2 = removed, 3 = rescan)
+/// 3 (rescan aka "re-stat something" kind) returned when OS based buffer
+/// has been overflown and some events might be loss. Paths will contain a list of
+/// directories that needs to be rescanned to ensure consistency.
+///
+/// ## Safety
+/// `batch` must be a valid `FffWatchEventBatch` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_watch_events_get_kind(
+    batch: *const FffWatchEventBatch,
+    index: u32,
+) -> u8 {
+    match unsafe { watch_event_at(batch, index) } {
+        Some(ev) => ev.kind,
+        None => 3,
+    }
+}
+
+unsafe fn watch_event_at<'a>(
+    batch: *const FffWatchEventBatch,
+    index: u32,
+) -> Option<&'a FffWatchEvent> {
+    if batch.is_null() {
+        return None;
+    }
+    let batch = unsafe { &*batch };
+    if batch.events.is_null() || index >= batch.count {
+        return None;
+    }
+    Some(unsafe { &*batch.events.add(index as usize) })
 }
 
 /// Free a watch event batch delivered to the instance callback.

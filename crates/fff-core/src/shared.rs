@@ -222,17 +222,13 @@ impl SharedFilePicker {
         Ok(())
     }
 
-    /// Subscribe to filesystem changes matching `pattern` with a callback.
+    /// Subscribe to filesystem changes matching `pattern`.
     ///
-    /// Patterns may be base-relative globs, exact paths inside the indexed
+    /// Patterns may be base-relative globs (./ works), exact paths inside the indexed
     /// tree, or existing directories. An empty pattern watches the whole tree.
     ///
-    /// Callbacks are serialized on a dedicated thread with no fff locks held,
-    /// so they may call back into the picker API without blocking index updates.
-    ///
-    /// Events reflect applied index changes, with each path appearing at most
-    /// once per callback batch. Each batch contains at most 128 events.
-    /// The watcher must be enabled and ready before subscribing.
+    /// Events are debounced and submitted in batches per 100-ms window at most 128 events.
+    /// Gitignored and other ignored files are never triggering watcher.
     pub fn watch(
         &self,
         pattern: &str,
@@ -242,6 +238,7 @@ impl SharedFilePicker {
         let (base_path, has_watcher, watcher_ready) = {
             let guard = self.read()?;
             let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
+
             (
                 picker.base_path().to_path_buf(),
                 picker.has_watcher(),

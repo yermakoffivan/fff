@@ -227,6 +227,18 @@ const ffiDefinition = {
     args: [FFIType.ptr],
     returns: FFIType.void,
   },
+  fff_watch_events_count: {
+    args: [FFIType.ptr],
+    returns: FFIType.u32,
+  },
+  fff_watch_events_get_path: {
+    args: [FFIType.ptr, FFIType.u32],
+    returns: FFIType.ptr,
+  },
+  fff_watch_events_get_kind: {
+    args: [FFIType.ptr, FFIType.u32],
+    returns: FFIType.u8,
+  },
 
   // Git
   fff_refresh_git_status: {
@@ -1374,15 +1386,6 @@ const FWO_VERSION = 0; // u32 (4 + 4 pad)
 const FWO_IGNORE = 8; // *const *const c_char (8)
 const FWO_IGNORE_COUNT = 16; // u32 (4 + 4 pad)
 
-// FffWatchEvent (16 bytes)
-const WE_PATH = 0; // *mut c_char (8)
-const WE_KIND = 8; // u8 (1 + 7 pad)
-const WE_SIZE_OF = 16;
-
-// FffWatchEventBatch (16 bytes)
-const WB_EVENTS = 0; // *mut FffWatchEvent (8)
-const WB_COUNT = 8; // u32 (4 + 4 pad)
-
 /** kind u8 -> WatchEventKind. Unknown values degrade to "rescan". */
 const WATCH_EVENT_KINDS: readonly WatchEventKind[] = [
   "created",
@@ -1402,19 +1405,20 @@ export function readWatchEventBatch(batchPtr: Pointer | number | null): WatchEve
   }
 
   const bp = batchPtr as unknown as Pointer;
-  const count = read.u32(bp, WB_COUNT);
-  const eventsBase = read.ptr(bp, WB_EVENTS);
+  const symbols = loadLibrary().symbols;
+  const count = symbols.fff_watch_events_count(bp);
 
   const events: WatchEvent[] = [];
   for (let i = 0; i < count; i++) {
-    const ep = asPtr(eventsBase + i * WE_SIZE_OF);
+    const path = symbols.fff_watch_events_get_path(bp, i) as Pointer | null;
+    const kind = symbols.fff_watch_events_get_kind(bp, i) as number;
     events.push({
-      path: readCString(read.ptr(ep, WE_PATH)) ?? "",
-      kind: WATCH_EVENT_KINDS[read.u8(ep, WE_KIND)] ?? "rescan",
+      path: readCString(path) ?? "",
+      kind: WATCH_EVENT_KINDS[kind] ?? "rescan",
     });
   }
 
-  loadLibrary().symbols.fff_free_watch_events(bp);
+  symbols.fff_free_watch_events(bp);
   return events;
 }
 

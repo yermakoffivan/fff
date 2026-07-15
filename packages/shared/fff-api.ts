@@ -567,10 +567,16 @@ export interface FileFinderApi {
   glob(pattern: string, options?: GlobOptions): Result<SearchResult>;
 
   /** Fuzzy directory search. */
-  directorySearch(query: string, options?: DirSearchOptions): Result<DirSearchResult>;
+  directorySearch(
+    query: string,
+    options?: DirSearchOptions,
+  ): Result<DirSearchResult>;
 
   /** Fuzzy search over files and directories interleaved by score. */
-  mixedSearch(query: string, options?: SearchOptions): Result<MixedSearchResult>;
+  mixedSearch(
+    query: string,
+    options?: SearchOptions,
+  ): Result<MixedSearchResult>;
 
   /** Content search (live grep). */
   grep(query: string, options?: GrepOptions): Result<GrepResult>;
@@ -629,21 +635,16 @@ export interface FileFinderApi {
   /**
    * Subscribe to filesystem changes matching `pattern`.
    *
-   * Pattern semantics:
-   * - Wildcards (`*.rs`, `src/&#42;&#42;`, `./&#42;&#42;/&#42;.ts`) — glob matched against the
-   *   base-path-relative path. Absolute globs must be under the base path.
-   * - No wildcards — resolved against the base path (must stay inside it):
-   *   an existing directory subscribes to its whole subtree, anything else
-   *   is an exact file path.
-   * - Omitted — subscribes to the entire indexed tree: `watch(callback)`.
+   * Patterns may be base-relative globs (./ works), exact paths inside the indexed
+   * tree, or existing directories. An empty pattern watches the whole tree.
    *
-   * The callback receives normalized batches of up to 128 events, with each
-   * path appearing at most once. Unsubscribing takes
-   * effect synchronously: once it returns, the callback will not run again.
-   *
-   * Requires the instance to be created with watching enabled (default).
+   * Events are debounced and submitted in batches per 100-ms window at most 128 events.
+   * Gitignored and other ignored files are never triggering watcher.
    */
-  watch(callback: WatchBatchCallback, options?: WatchOptions): Result<WatchUnsubscribe>;
+  watch(
+    callback: WatchBatchCallback,
+    options?: WatchOptions,
+  ): Result<WatchUnsubscribe>;
   watch(
     pattern: string,
     callback: WatchBatchCallback,
