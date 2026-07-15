@@ -47,26 +47,11 @@ function detectRuntime(): "bun" | "node" {
 
 function loadSdk(): Promise<{ FileFinder: FileFinderStatic }> {
   if (sdkPromise) return sdkPromise;
-  const bunPkg = "@ff-labs/fff-bun";
-  const nodePkg = "@ff-labs/fff-node";
-  const preferred = detectRuntime() === "bun" ? bunPkg : nodePkg;
-  const fallback = preferred === bunPkg ? nodePkg : bunPkg;
-
-  sdkPromise = (async () => {
-    try {
-      return (await import(preferred)) as { FileFinder: FileFinderStatic };
-    } catch (e) {
-      try {
-        return (await import(fallback)) as { FileFinder: FileFinderStatic };
-      } catch {
-        throw new Error(
-          `pi-fff: neither ${preferred} nor ${fallback} could be loaded (${
-            e instanceof Error ? e.message : String(e)
-          })`,
-        );
-      }
-    }
-  })();
+  // Fail loud on wrong-runtime SDK rather than falling back — a fallback would
+  // re-introduce the ffi-rs cost on bun (the whole point of the bun SDK is to
+  // avoid it) and mask packaging bugs where the correct SDK wasn't installed.
+  const pkg = detectRuntime() === "bun" ? "@ff-labs/fff-bun" : "@ff-labs/fff-node";
+  sdkPromise = import(pkg) as Promise<{ FileFinder: FileFinderStatic }>;
   return sdkPromise;
 }
 
