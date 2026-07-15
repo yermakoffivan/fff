@@ -1,18 +1,15 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { FileFinder } from "@ff-labs/fff-node";
-
-// Hotfix prototype for issue #463: agent occasionally needs to grep/find
-// outside the workspace cwd. Maintain a tiny rotating pool of additional
-// FileFinder instances rooted at out-of-workspace paths. LRU-evicted at
-// MAX_AUX, dropped after IDLE_TTL_MS of no use.
+import type { FileFinderApi } from "@ff-labs/fff-node";
+import { loadSdk, SCAN_TIMEOUT_MS } from "./sdk";
 
 export const MAX_AUX = 3;
 export const IDLE_TTL_MS = 5 * 60 * 1000;
 
-interface AuxEntry {
+interface AuxPicker {
   root: string;
-  finder: FileFinder;
+  finder: FileFinderApi;
   lastUsed: number;
 }
 
@@ -23,11 +20,19 @@ export interface AuxOpts {
 }
 
 export class AuxFinderPool {
-  private entries: AuxEntry[] = [];
+  private entries: AuxPicker[] = [];
   constructor(private opts: AuxOpts) {}
 
+  destroy(): void {
+    for (const e of this.entries) {
+      e.finder.destroy();
+    }
+
+    this.entries = [];
+  }
+
   private sweepIdle(now = Date.now()): void {
-    const kept: AuxEntry[] = [];
+    const kept: AuxPicker[] = [];
     for (const e of this.entries) {
       if (now - e.lastUsed > IDLE_TTL_MS) {
         if (!e.finder.isDestroyed) e.finder.destroy();
@@ -38,21 +43,34 @@ export class AuxFinderPool {
     this.entries = kept;
   }
 
-  async acquire(root: string): Promise<FileFinder> {
+  async acquire(
+    maybeRoot: string,
+    opts?: { exact?: boolean },
+  ): Promise<{ finder: FileFinderApi; root: string }> {
     this.sweepIdle();
-    const existing = this.entries.find((e) => e.root === root);
-    if (existing && !existing.finder.isDestroyed) {
-      existing.lastUsed = Date.now();
-      return existing.finder;
+    let covering: AuxPicker | null = null;
+    for (const e of this.entries) {
+      if (e.finder.isDestroyed) continue;
+      if (opts?.exact ? e.root !== maybeRoot : !rootCovers(e.root, maybeRoot)) continue;
+      if (!covering || e.root.length > covering.root.length) covering = e;
     }
+
+    if (covering) {
+      covering.lastUsed = Date.now();
+      return { finder: covering.finder, root: covering.root };
+    }
+
     if (this.entries.length >= MAX_AUX) {
       let oldest = this.entries[0];
-      for (const e of this.entries) if (e.lastUsed < oldest.lastUsed) oldest = e;
+      for (const e of this.entries)
+        if (e.lastUsed < oldest.lastUsed) oldest = e;
       if (!oldest.finder.isDestroyed) oldest.finder.destroy();
       this.entries = this.entries.filter((e) => e !== oldest);
     }
+
+    const { FileFinder } = await loadSdk();
     const result = FileFinder.create({
-      basePath: root,
+      basePath: maybeRoot,
       frecencyDbPath: this.opts.frecencyDbPath,
       historyDbPath: this.opts.historyDbPath,
       aiMode: true,
@@ -60,67 +78,82 @@ export class AuxFinderPool {
       enableFsRootScanning: this.opts.enableFsRootScanning,
     });
     if (!result.ok)
-      throw new Error(`Failed to create aux file finder for ${root}: ${result.error}`);
-    await result.value.waitForScan(15000);
-    this.entries.push({ root, finder: result.value, lastUsed: Date.now() });
-    return result.value;
+      throw new Error(
+        `Failed to create aux file finder for ${maybeRoot}: ${result.error}`,
+      );
+
+    await result.value.waitForScan(SCAN_TIMEOUT_MS);
+    this.entries.push({ root: maybeRoot, finder: result.value, lastUsed: Date.now() });
+    return { finder: result.value, root: maybeRoot };
   }
 
-  destroyAll(): void {
-    for (const e of this.entries) if (!e.finder.isDestroyed) e.finder.destroy();
-    this.entries = [];
-  }
-
-  // Exposed for tests/diagnostics.
   size(): number {
     this.sweepIdle();
     return this.entries.length;
   }
 }
 
-// Split an absolute path into the longest non-glob directory prefix (the aux
-// root) and a remainder usable as a path constraint relative to that root.
-// Returns null if the prefix doesn't exist on disk.
+// Split an absolute path into an existing directory (the aux root) and a
+// remainder usable as a fuzzy path constraint relative to that root. Glob and
+// nonexistent segments both go into the suffix: we walk up to the nearest
+// existing ancestor so partially-wrong paths still resolve to a search root.
 export function resolveAuxRoot(
   absPath: string,
 ): { root: string; suffix: string } | null {
-  const normalized = path.normalize(absPath.trim());
-  if (!path.isAbsolute(normalized)) return null;
-  const parts = normalized.split(path.sep);
+  const trimmed = path.normalize(absPath.trim()).replace(/\/+$/, "") || "/";
+  if (!path.isAbsolute(trimmed)) return null;
+  if (trimmed === path.sep) return { root: path.sep, suffix: "" };
+
+  const parts = trimmed.split(path.sep);
   const firstGlob = parts.findIndex((p) => /[*?[{]/.test(p));
-  let rootPath: string;
-  let suffix: string;
-  if (firstGlob === -1) {
-    rootPath = normalized;
-    suffix = "";
-  } else {
-    rootPath = parts.slice(0, firstGlob).join(path.sep) || path.sep;
-    suffix = parts.slice(firstGlob).join("/");
+  const boundary = firstGlob === -1 ? parts.length : firstGlob;
+
+  // Deepest existing non-glob prefix wins; everything below it is suffix.
+  for (let i = boundary; i > 0; i--) {
+    const candidate = parts.slice(0, i).join(path.sep) || path.sep;
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(candidate);
+    } catch {
+      continue;
+    }
+    if (stat.isFile()) {
+      return {
+        root: parts.slice(0, i - 1).join(path.sep) || path.sep,
+        suffix: parts.slice(i - 1).join("/"),
+      };
+    }
+    return { root: candidate, suffix: parts.slice(i).join("/") };
   }
-  const stripped = rootPath.replace(/\/+$/, "") || "/";
-  let stat: fs.Stats;
-  try {
-    stat = fs.statSync(stripped);
-  } catch {
-    return null;
-  }
-  if (stat.isFile()) {
-    return { root: path.dirname(stripped), suffix: path.basename(stripped) };
-  }
-  return { root: stripped, suffix };
+  return null;
 }
 
 // Decide whether a `path` parameter should route to the workspace finder or
-// to an aux finder. An absolute path is "outside workspace" when the relative
-// from cwd starts with `..`. Returns null to signal "no rerouting".
+// to an aux finder. Accepts absolute paths, `~`-prefixed paths, and relative
+// paths escaping the workspace (`../other-project`); everything is resolved
+// against cwd first. Returns null to signal "no rerouting" (workspace finder).
 export function routePathConstraint(
   pathConstraint: string | undefined,
   cwd: string,
 ): { root: string; suffix: string } | null {
   if (!pathConstraint) return null;
-  const trimmed = pathConstraint.trim();
-  if (!trimmed || !path.isAbsolute(trimmed)) return null;
-  const rel = path.relative(cwd, trimmed);
-  if (!rel.startsWith("..") && rel !== "..") return null;
-  return resolveAuxRoot(trimmed);
+  let candidate = pathConstraint.trim();
+  if (!candidate) return null;
+  if (candidate === "~" || candidate.startsWith("~/"))
+    candidate = path.join(os.homedir(), candidate.slice(1));
+  if (!path.isAbsolute(candidate)) {
+    // Plain workspace-relative constraints stay on the workspace finder.
+    if (candidate !== ".." && !candidate.startsWith("../")) return null;
+    candidate = path.resolve(cwd, candidate);
+  }
+  const rel = path.relative(cwd, candidate);
+  if (rel !== ".." && !rel.startsWith(`..${path.sep}`)) return null;
+  return resolveAuxRoot(candidate);
+}
+
+
+export function rootCovers(root: string, target: string): boolean {
+  if (root === target) return true;
+  const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+  return target.startsWith(prefix);
 }
