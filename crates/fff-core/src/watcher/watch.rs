@@ -244,6 +244,8 @@ struct CallbackDispatcher {
 }
 
 impl CallbackDispatcher {
+    /// We have to use a separate thread becuause the callback is the actual C function pointer which
+    /// can block on the user side, we can not allow our watcher logic to get into deadlocked state
     fn start(&self) -> Result<(), Error> {
         let mut state = self.state.lock();
         if state.sender.is_some() {
@@ -642,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_batch_dispatch_preserves_order_and_semantics() {
+    fn mixed_batch_dispatch_preserves_order_and_filters() {
         let base = Path::new("/repo");
         let registry = registry(base);
 
@@ -669,7 +671,6 @@ mod tests {
         registry.dispatch(
             base,
             vec![
-                raw("/repo", WatchEventKind::Rescan, false),
                 raw("/repo/src/a.rs", WatchEventKind::Created, false),
                 raw("/repo/src/b.gen.rs", WatchEventKind::Modified, false),
                 raw("/repo/src/vendor/c.rs", WatchEventKind::Modified, false),
@@ -679,36 +680,51 @@ mod tests {
             ],
         );
 
-        let glob = wait_events(&glob_events, 3);
+        let glob = wait_events(&glob_events, 2);
         let paths: Vec<_> = glob.iter().map(|e| e.path.clone()).collect();
-        // rescan first, then matches in batch order; ignore globs/prefixes
-        // and index-ignored files subtracted
         assert_eq!(
             paths,
             vec![
-                PathBuf::from("/repo"),
                 PathBuf::from("/repo/src/a.rs"),
                 PathBuf::from("/repo/lib/d.rs"),
             ]
         );
-        assert_eq!(glob[0].kind, WatchEventKind::Rescan);
 
-        let dir = wait_events(&dir_events, 4);
+        let dir = wait_events(&dir_events, 3);
         let paths: Vec<_> = dir.iter().map(|e| e.path.clone()).collect();
         assert_eq!(
             paths,
             vec![
-                PathBuf::from("/repo"),
                 PathBuf::from("/repo/src/a.rs"),
                 PathBuf::from("/repo/src/b.gen.rs"),
                 PathBuf::from("/repo/src/vendor/c.rs"),
             ]
         );
 
-        // exact subs also never see index-ignored paths
-        let exact = wait_events(&exact_events, 1);
-        let paths: Vec<_> = exact.iter().map(|e| e.path.clone()).collect();
-        assert_eq!(paths, vec![PathBuf::from("/repo")]);
+        assert!(exact_events.lock().is_empty());
+    }
+
+    #[test]
+    fn rescan_is_broadcast_to_every_subscription() {
+        let base = Path::new("/repo");
+        let registry = registry(base);
+        let (glob_cb, glob_events) = collector();
+        let (exact_cb, exact_events) = collector();
+        registry
+            .subscribe(base, "src/**", WatchOptions::default(), glob_cb)
+            .unwrap();
+        registry
+            .subscribe(base, "dist/out.js", WatchOptions::default(), exact_cb)
+            .unwrap();
+
+        registry.dispatch_rescan(base);
+
+        for events in [&glob_events, &exact_events] {
+            let events = wait_events(events, 1);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].path, base);
+            assert_eq!(events[0].kind, WatchEventKind::Rescan);
+        }
     }
 
     #[test]

@@ -21,7 +21,7 @@
 //!   with optional constraint filtering.
 //! - [`git`] — Git status caching and repository detection.
 //! - [`watch`] — Client-facing filesystem watch subscriptions: glob, exact
-//!   path, or directory subtree with raw debounced batch delivery
+//!   path, or directory subtree with normalized batch delivery
 //!   (see [`SharedFilePicker::watch`]).
 //!
 //! ## Shared State

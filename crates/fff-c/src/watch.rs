@@ -1,18 +1,13 @@
 //! C FFI for filesystem watch subscriptions.
 //!
-//! Delivery model: ONE callback per instance, registered once with
-//! `fff_set_watch_callback` and shared by every `fff_watch` subscription.
-//! It receives `(watch_id, batch)` on fff's dedicated callback thread;
-//! clients route by id (a map lookup). Batch ownership transfers to the
-//! callee: it MUST free the batch with `fff_free_watch_events` (possibly
-//! later / on another thread — required for async runtimes like Bun's
-//! threadsafe JSCallback). Each raw batch contains at most 128 events.
-//! The callback + `user_data` should stay valid
-//! until `fff_destroy` returns; destruction waits for native callback
-//! invocations to finish.
-//!
-//! `fff_unwatch` is non-blocking: one batch already being dispatched may
-//! still reach the callback after it returns.
+//! Delivery model: ONE callback per instance (`fff_set_watch_callback`) shared
+//! by every `fff_watch` subscription; it receives `(watch_id, batch)` on fff's
+//! callback thread and clients route by id. Batch ownership transfers to the
+//! callee, which MUST free it with `fff_free_watch_events` (possibly later /
+//! on another thread). Batches hold at most 128 events, each path once.
+//! Callback + `user_data` must stay valid until `fff_destroy` returns, which
+//! waits for in-flight invocations. `fff_unwatch` is non-blocking: one batch
+//! already dispatching may still arrive after it returns.
 
 use std::ffi::{CString, c_char, c_void};
 use std::ptr;
@@ -27,23 +22,20 @@ use crate::instance_ref;
 /// Current version of [`FffWatchOptions`].
 pub const FFF_WATCH_OPTIONS_VERSION: u32 = 1;
 
-/// Options for `fff_watch`. Versioned: new fields are only appended,
-/// callers set `version` to the version they were built for.
+/// Options for `fff_watch`. Versioned: new fields are only appended.
 #[repr(C)]
 pub struct FffWatchOptions {
     /// Set to [`FFF_WATCH_OPTIONS_VERSION`] when allocating.
     pub version: u32,
-    /// Per-subscription excludes (parcel-watcher style): entries with
-    /// wildcards are globs against the base-relative path, entries without
-    /// are path prefixes. NULL when `ignore_count` is 0.
+    /// Per-subscription excludes (parcel-watcher style): entries with wildcards
+    /// are base-relative globs, entries without are path prefixes. NULL when
+    /// `ignore_count` is 0.
     pub ignore: *const *const c_char,
     pub ignore_count: u32,
     // ----- new version 2+ fields go here, ALWAYS appended -----
 }
 
-/// A single watch event.
-///
-/// `kind`: 0 = created, 1 = modified, 2 = removed,
+/// A single watch event. `kind`: 0 = created, 1 = modified, 2 = removed,
 /// 3 = rescan (events were lost; re-stat what you care about).
 #[repr(C)]
 pub struct FffWatchEvent {
@@ -59,9 +51,8 @@ pub struct FffWatchEventBatch {
     pub count: u32,
 }
 
-/// Instance-wide callback invoked with `(watch_id, batch)` for every
-/// subscription created by `fff_watch`. See the module docs for the
-/// ownership contract: the callee frees `batch` with `fff_free_watch_events`.
+/// Instance-wide callback invoked with `(watch_id, batch)` for every `fff_watch`
+/// subscription. The callee owns and frees `batch` via `fff_free_watch_events`.
 pub type FffWatchCallback =
     unsafe extern "C" fn(watch_id: u64, batch: *mut FffWatchEventBatch, user_data: *mut c_void);
 
@@ -155,15 +146,11 @@ impl WatchCallbackSlot {
 }
 
 /// Register the instance-wide watch callback used by all `fff_watch`
-/// subscriptions. Call once before the first `fff_watch`; calling again
-/// replaces the callback for subsequent deliveries.
-///
-/// The callback runs on fff's dedicated callback thread. It must be
-/// thread-safe and must free each batch with `fff_free_watch_events`.
+/// subscriptions; call before the first `fff_watch`, calling again replaces it.
 ///
 /// ## Safety
 /// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
-/// * `callback` must remain callable — and `user_data` valid — until
+/// * `callback` must remain callable until fff_unwatch called
 ///   `fff_destroy(fff_handle)` returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_set_watch_callback(
@@ -179,19 +166,13 @@ pub unsafe extern "C" fn fff_set_watch_callback(
     FffResult::ok_empty()
 }
 
-/// Subscribe to filesystem changes with delivery through the instance
-/// callback registered by `fff_set_watch_callback`.
+/// Subscribe to filesystem changes, delivered through the instance callback
+/// registered by `fff_set_watch_callback`.
 ///
-/// `pattern` semantics: wildcards = base-relative glob (e.g. `*.rs` or a
-/// subtree glob like `src` + `/` + `**`); no wildcards = path inside the
-/// indexed tree — an existing directory subscribes to its whole subtree
-/// (parcel-watcher style), anything else is an exact file path.
-/// NULL (or an empty string) subscribes to the entire indexed tree.
-/// `opts.ignore` filters matches out.
+/// Returns the watch id, pass it to `fff_unwatch` to stop.
 ///
-/// Returns the watch id in `int_value`; pass it to `fff_unwatch` to stop.
-/// Note: delivery for a new subscription may begin before this function
-/// returns — route by `watch_id` and treat unknown ids as benign.
+/// `pattern` if non `NULL` can be wildcard pattern, absolute, or relative path
+/// that will be used to filter the events triggering exact subscription.
 ///
 /// ## Safety
 /// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -238,12 +219,8 @@ pub unsafe extern "C" fn fff_watch(
     }
 }
 
-/// Calling-convention adapter for [`fff_watch`] with flattened options.
-///
-/// For FFI libraries that cannot marshal pointer arrays inside structs
-/// (e.g. Node's `ffi-rs`, which supports string arrays only as top-level
-/// parameters). Semantics are identical to `fff_watch` with an
-/// [`FffWatchOptions`] carrying the same values.
+/// [`fff_watch`] adapter with flattened options, for FFI libraries that cannot
+/// marshal pointer arrays inside structs (e.g. Node's `ffi-rs`).
 ///
 /// ## Safety
 /// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -265,10 +242,6 @@ pub unsafe extern "C" fn fff_watch_args(
 }
 
 /// Remove a watch subscription. `int_value` = 1 if the id existed, 0 otherwise.
-///
-/// Non-blocking: a batch already being dispatched may still reach the
-/// instance callback (with this id) after this returns — treat it as a
-/// lookup miss. The hard "never again" point is `fff_destroy`.
 ///
 /// ## Safety
 /// `fff_handle` must be a valid instance pointer from `fff_create_instance`.

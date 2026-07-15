@@ -1802,8 +1802,8 @@ function releaseWatchTrampolineIfIdle(): void {
 }
 
 /**
- * Create a push-mode watch subscription. `callback` receives one raw event
- * raw batch of up to 128 events, delivered on the JS event loop.
+ * Create a push-mode watch subscription. `callback` receives a normalized
+ * batch of up to 128 events, delivered on the JS event loop.
  *
  * Returns the native watch id to pass to `ffiUnwatch`.
  */

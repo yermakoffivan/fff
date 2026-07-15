@@ -631,8 +631,8 @@ export class FileFinder implements FileFinderApi {
   /**
    * Subscribe to filesystem changes matching `pattern` (glob, exact file,
    * or directory subtree). Omit the pattern to watch the entire indexed
-   * tree. Raw batches of up to 128 events are delivered on the JS event loop,
-   * and duplicate paths may appear. See `FileFinderApi.watch`.
+   * tree. Normalized batches of up to 128 events are delivered on the JS event
+   * loop, with each path appearing at most once. See `FileFinderApi.watch`.
    *
    * @example
    * ```typescript

@@ -610,8 +610,8 @@ export class FileFinder implements FileFinderApi {
    *
    * Push-based: events are delivered by the native watcher through a single
    * process-wide callback trampoline (no polling, no idle wakeups). The
-   * callback receives raw batches of up to 128 events on the JS event loop;
-   * duplicate paths may appear.
+   * callback receives normalized batches of up to 128 events on the JS event
+   * loop, with each path appearing at most once.
    *
    * Requires the instance to be created with watching enabled (default).
    *

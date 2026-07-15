@@ -1639,18 +1639,18 @@ impl FilePicker {
         self.remove_all_files_in_dir_inner(dir.as_ref(), None)
     }
 
-    pub(crate) fn remove_all_files_in_dir_with_paths(
+    pub(crate) fn remove_all_files_in_dir_with_callback(
         &mut self,
         dir: impl AsRef<Path>,
-        removed_paths: &mut Vec<PathBuf>,
+        mut callback: impl FnMut(&Path),
     ) -> usize {
-        self.remove_all_files_in_dir_inner(dir.as_ref(), Some(removed_paths))
+        self.remove_all_files_in_dir_inner(dir.as_ref(), Some(&mut callback))
     }
 
     fn remove_all_files_in_dir_inner(
         &mut self,
         dir_path: &Path,
-        mut removed_paths: Option<&mut Vec<PathBuf>>,
+        mut callback: Option<&mut dyn FnMut(&Path)>,
     ) -> usize {
         let Some(relative_dir) = self
             .to_relative_path(dir_path)
@@ -1671,11 +1671,8 @@ impl FilePicker {
         self.sync_data.tombstone_files_with_arena(
             |file, arena| file.relative_path_starts_with(arena, &dir_prefix),
             |file, arena| {
-                if let Some(paths) = removed_paths.as_deref_mut() {
-                    paths.push(
-                        file.write_absolute_path(arena, &base_path, &mut path_buf)
-                            .to_path_buf(),
-                    );
+                if let Some(callback) = callback.as_mut() {
+                    callback(file.write_absolute_path(arena, &base_path, &mut path_buf));
                 }
             },
         )
@@ -2318,7 +2315,9 @@ mod tests {
 
         let mut removed = Vec::new();
         assert_eq!(
-            picker.remove_all_files_in_dir_with_paths(&removed_dir, &mut removed),
+            picker.remove_all_files_in_dir_with_callback(&removed_dir, |path| {
+                removed.push(path.to_path_buf());
+            }),
             2
         );
         removed.sort_unstable();

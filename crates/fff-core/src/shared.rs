@@ -230,8 +230,8 @@ impl SharedFilePicker {
     /// Callbacks are serialized on a dedicated thread with no fff locks held,
     /// so they may call back into the picker API without blocking index updates.
     ///
-    /// Raw events retain their order and may contain duplicate paths. Each
-    /// callback batch contains at most 128 events.
+    /// Events reflect applied index changes, with each path appearing at most
+    /// once per callback batch. Each batch contains at most 128 events.
     /// The watcher must be enabled and ready before subscribing.
     pub fn watch(
         &self,

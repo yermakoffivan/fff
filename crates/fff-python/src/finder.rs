@@ -751,9 +751,9 @@ impl FileFinder {
     /// `ignore` entries exclude matches per subscription (globs or path
     /// prefixes).
     ///
-    /// `callback` receives raw batches of up to 128 events on a dedicated
-    /// callback thread. Duplicate paths may appear. An event with kind
-    /// `"rescan"` means events were lost and the consumer should re-stat.
+    /// `callback` receives normalized batches of up to 128 events on a
+    /// dedicated callback thread. Each path appears at most once. An event
+    /// with kind `"rescan"` means events were lost and the consumer should re-stat.
     /// Callback exceptions are reported via `sys.unraisablehook` and never
     /// propagate. Requires the finder to be created with `watch=True`.
     ///

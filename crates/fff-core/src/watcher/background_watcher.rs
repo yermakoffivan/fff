@@ -343,10 +343,8 @@ fn handle_debounced_events(
     let mut new_dirs_to_watch = Vec::new();
     let mut affected_paths_count = 0usize;
 
-    // Capture raw events for watch subscriptions only when someone listens.
     let watch_registry = shared_picker.watch_registry();
-    let capture_watch_events = watch_registry.is_active();
-    let mut watch_events: Vec<RawWatchEvent> = Vec::new();
+    let need_events_propagation = watch_registry.is_active();
 
     for debounced_event in &events {
         // It is very important to not react to the access errors because we inevitably
@@ -430,33 +428,11 @@ fn handle_debounced_events(
 
             let is_removed = is_folder_removal || is_removal || !path.exists();
 
-            // Statted once, shared by the watch capture and the index update
-            // (the ignore-rules walk is the expensive part). Ignore rules
-            // stat the path, so they misreport deleted files: removals start
-            // as "ignored" and are re-marked visible after the index confirms
-            // it actually held the file (index presence == never ignored).
             let (is_dir, is_ignored) = if is_removed {
                 (false, true)
             } else {
                 (path.is_dir(), filter.is_ignored(path))
             };
-
-            if capture_watch_events {
-                let kind = if is_removed {
-                    WatchEventKind::Removed
-                } else if matches!(debounced_event.event.kind, EventKind::Create(_)) {
-                    WatchEventKind::Created
-                } else {
-                    WatchEventKind::Modified
-                };
-                if is_removed || (!is_dir && !is_ignored) {
-                    watch_events.push(RawWatchEvent {
-                        path: path.to_path_buf(),
-                        kind,
-                        is_ignored,
-                    });
-                }
-            }
 
             if is_folder_removal {
                 dirs_to_remove.push(path.to_path_buf());
@@ -525,9 +501,7 @@ fn handle_debounced_events(
     let mut need_full_rescan = false;
     let mut overflow_count = 0;
     let mut removed_from_dirs = Vec::new();
-    // Removals confirmed by the index; used to mark Removed watch events as
-    // non-ignored (a file the index held was by definition not ignored).
-    let mut confirmed_removed: ahash::AHashSet<PathBuf> = ahash::AHashSet::new();
+    let mut watch_events = ahash::AHashMap::new();
 
     if !paths_to_remove.is_empty()
         || !dirs_to_remove.is_empty()
@@ -550,29 +524,44 @@ fn handle_debounced_events(
         };
 
         for dir in &dirs_to_remove {
-            let count = if capture_watch_events {
-                picker.remove_all_files_in_dir_with_paths(dir, &mut removed_from_dirs)
+            if need_events_propagation {
+                picker.remove_all_files_in_dir_with_callback(dir, |path| {
+                    removed_from_dirs.push(path.to_path_buf());
+                })
             } else {
                 picker.remove_all_files_in_dir(dir)
             };
-            debug!("remove_all_files_in_dir({:?}) -> {} files", dir, count);
-            if capture_watch_events && count > 0 {
-                confirmed_removed.insert(dir.clone());
+        }
+
+        if need_events_propagation {
+            for path in removed_from_dirs.drain(..) {
+                watch_events.insert(path, WatchEventKind::Removed);
             }
         }
 
         for path in &paths_to_remove {
             let removed = picker.remove_file_by_path(path);
-            debug!("remove_file_by_path({:?}) -> {}", path, removed);
-            if capture_watch_events && removed {
-                confirmed_removed.insert(path.to_path_buf());
+
+            if need_events_propagation && removed {
+                watch_events.insert(path.to_path_buf(), WatchEventKind::Removed);
             }
         }
 
         files_to_update_git_status.reserve(paths_to_add_or_modify.len());
         for path in &paths_to_add_or_modify {
+            let existed = need_events_propagation && picker.get_file_by_path(path).is_some();
+
             if picker.handle_create_or_modify(path).is_some() {
                 files_to_update_git_status.push(path.to_path_buf());
+                if need_events_propagation {
+                    let kind = if existed {
+                        WatchEventKind::Modified
+                    } else {
+                        WatchEventKind::Created
+                    };
+
+                    watch_events.insert(path.to_path_buf(), kind);
+                }
             } else {
                 need_full_rescan = true;
             }
@@ -586,26 +575,24 @@ fn handle_debounced_events(
         overflow_count, "File index changes applied",
     );
 
-    if capture_watch_events {
-        watch_events.extend(removed_from_dirs.into_iter().map(|path| RawWatchEvent {
-            path,
-            kind: WatchEventKind::Removed,
-            is_ignored: false,
-        }));
-        for ev in &mut watch_events {
-            if ev.kind == WatchEventKind::Removed && confirmed_removed.contains(&ev.path) {
-                ev.is_ignored = false;
-            }
-        }
-        watch_registry.dispatch(base_path, watch_events);
-    }
-
     if need_full_rescan || overflow_count > MAX_OVERFLOW_FILES {
         info!("Watcher faced limit of index overflow. Triggering rescan");
         watch_registry.dispatch_rescan(base_path);
         if let Err(e) = shared_picker.trigger_full_rescan_async(shared_frecency) {
             error!("Failed to trigger full rescan: {:?}", e);
         }
+    } else if need_events_propagation {
+        watch_registry.dispatch(
+            base_path,
+            watch_events
+                .into_iter()
+                .map(|(path, kind)| RawWatchEvent {
+                    path,
+                    kind,
+                    is_ignored: false,
+                })
+                .collect(),
+        );
     }
 
     // AI mode: auto-track frecency for all modified/created files.
@@ -873,6 +860,76 @@ fn watch_git_status_paths(debouncer: &mut Debouncer, git_workdir: Option<&PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_picker::{FilePicker, FilePickerOptions};
+    use crate::watch::{WatchEvent, WatchOptions};
+    use notify::Event;
+    use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn replacement_batch_emits_one_modified_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let path = base.join("file.txt");
+        std::fs::write(&path, "before").unwrap();
+
+        let shared_picker = SharedFilePicker::default();
+        let shared_frecency = SharedFrecency::noop();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        shared_picker.rebase_watches(&base);
+        *shared_picker.write().unwrap() = Some(picker);
+
+        let (sender, receiver) = mpsc::channel::<Vec<WatchEvent>>();
+        shared_picker
+            .watch_registry()
+            .subscribe(
+                &base,
+                "**",
+                WatchOptions::default(),
+                Box::new(move |_, events| sender.send(events.to_vec()).unwrap()),
+            )
+            .unwrap();
+
+        std::fs::write(&path, "after").unwrap();
+        let now = Instant::now();
+        let events = vec![
+            DebouncedEvent::new(
+                Event::new(EventKind::Remove(RemoveKind::File)).add_path(path.clone()),
+                now,
+            ),
+            DebouncedEvent::new(
+                Event::new(EventKind::Create(CreateKind::File)).add_path(path.clone()),
+                now,
+            ),
+            DebouncedEvent::new(
+                Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                    .add_path(path.clone()),
+                now,
+            ),
+        ];
+
+        handle_debounced_events(
+            FFFMode::Neovim,
+            events,
+            &base,
+            &None,
+            &shared_picker,
+            &shared_frecency,
+            &GitStatusWorker::new(),
+        );
+
+        let received = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].path, path);
+        assert_eq!(received[0].kind, WatchEventKind::Modified);
+    }
 
     #[test]
     fn dotgit_status_filter_matches_worktree_state_changes() {

@@ -11,9 +11,9 @@
 import { after, before, describe, it, mock } from "node:test";
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { promisify } from "node:util";
 import { FileFinder } from "../dist/src/index.js";
 
@@ -40,7 +40,9 @@ let baseDir = "";
 
 describe("fff-node watch", { concurrency: 1 }, () => {
   before(async () => {
-    baseDir = mkdtempSync(join(tmpdir(), "fff-watch-test-"));
+    // realpath: Windows tmpdir() may return an 8.3 short path (RUNNER~1) that
+    // won't prefix-match the core's canonicalized base when used as a pattern
+    baseDir = realpathSync(mkdtempSync(join(tmpdir(), "fff-watch-test-")));
     const dbDir = mkdtempSync(join(tmpdir(), "fff-watch-db-"));
 
     // Seed files so the initial scan has content
@@ -197,11 +199,11 @@ describe("fff-node watch", { concurrency: 1 }, () => {
     writeFileSync(join(baseDir, "dir-noise.skiplog"), "noise\n");
 
     const got = await waitFor(() =>
-      received.some((e) => e.path.endsWith("/dir-shape.txt")),
+      received.some((e) => e.path.endsWith(`${sep}dir-shape.txt`)),
     );
     assert.ok(got, `expected dir-shape.txt event, got ${JSON.stringify(received)}`);
     assert.ok(
-      !received.some((e) => e.path.endsWith("/dir-noise.skiplog")),
+      !received.some((e) => e.path.endsWith(`${sep}dir-noise.skiplog`)),
       `ignore glob leaked: ${JSON.stringify(received)}`,
     );
 

@@ -12,6 +12,10 @@
  * compilers.
  */
 
+/* expose mkdtemp/usleep under -std=c99 on glibc; harmless on musl/darwin */
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+
 #include <fff.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -262,7 +266,7 @@ int main(int argc, char **argv) {
     }
 
     if (watch_smoke() != 0) {
-        fprintf(stderr, "FAIL: watch test failed", total);
+        fprintf(stderr, "FAIL: watch test failed\n");
         return 1;
     }
 

@@ -98,11 +98,11 @@ finder.destroy();
 ## Watching files
 
 Subscribe to filesystem changes with a glob, an exact path, or a directory
-subtree. Events are debounced and delivered as raw batches of up to 128
-events, so callbacks stay cheap even under heavy churn.
+subtree. Events reflect applied index changes and are delivered in batches of
+up to 128, so callbacks stay cheap even under heavy churn.
 
 ```typescript
-// Raw batches contain at most 128 events
+// Each path appears at most once per batch
 const sub = finder.watch("src/**/*.ts", (events) => {
   for (const e of events) console.log(e.kind, e.path); // created | modified | removed | rescan
 });

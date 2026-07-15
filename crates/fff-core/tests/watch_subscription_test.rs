@@ -139,6 +139,73 @@ fn glob_subscription_receives_created_and_removed_events() {
 }
 
 #[test]
+fn watch_events_reflect_applied_file_transitions() {
+    let tmp = TempDir::new().unwrap();
+    let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let removed_path = base.join("removed.txt");
+    let created_path = base.join("created.txt");
+    let replaced_path = base.join("replaced.txt");
+    fs::write(&removed_path, "remove me").unwrap();
+    fs::write(&replaced_path, "before").unwrap();
+
+    let (picker, _frecency) = make_watched_picker(&base);
+    let removed = watch_collect(
+        &picker,
+        removed_path.to_str().unwrap(),
+        WatchOptions::default(),
+    );
+    let created = watch_collect(
+        &picker,
+        created_path.to_str().unwrap(),
+        WatchOptions::default(),
+    );
+    let replaced = watch_collect(
+        &picker,
+        replaced_path.to_str().unwrap(),
+        WatchOptions::default(),
+    );
+
+    fs::remove_file(&removed_path).unwrap();
+    assert!(
+        wait_for(|| !removed.lock().is_empty(), Duration::from_secs(10)),
+        "remove event was not delivered"
+    );
+
+    fs::write(&created_path, "created").unwrap();
+    assert!(
+        wait_for(|| !created.lock().is_empty(), Duration::from_secs(10)),
+        "create event was not delivered"
+    );
+
+    fs::remove_file(&replaced_path).unwrap();
+    fs::write(&replaced_path, "after").unwrap();
+    assert!(
+        wait_for(|| !replaced.lock().is_empty(), Duration::from_secs(10)),
+        "replacement event was not delivered"
+    );
+
+    std::thread::sleep(Duration::from_millis(300));
+    let removed = removed.lock();
+    assert_eq!(removed.len(), 1, "unexpected remove events: {removed:?}");
+    assert_eq!(removed[0].path, removed_path);
+    assert_eq!(removed[0].kind, WatchEventKind::Removed);
+
+    let created = created.lock();
+    assert_eq!(created.len(), 1, "unexpected create events: {created:?}");
+    assert_eq!(created[0].path, created_path);
+    assert_eq!(created[0].kind, WatchEventKind::Created);
+
+    let replaced = replaced.lock();
+    assert_eq!(
+        replaced.len(),
+        1,
+        "replacement must be one event: {replaced:?}"
+    );
+    assert_eq!(replaced[0].path, replaced_path);
+    assert_eq!(replaced[0].kind, WatchEventKind::Modified);
+}
+
+#[test]
 fn empty_pattern_watches_the_whole_tree() {
     let tmp = TempDir::new().unwrap();
     let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();

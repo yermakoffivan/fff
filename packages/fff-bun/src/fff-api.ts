@@ -294,8 +294,8 @@ export interface ScanProgress {
 }
 
 /**
- * Normalized watch event kind
- * normalized means if some file was removed and created within 100ms it will be marked as modified
+ * Normalized watch event kind.
+ * A file removed and recreated in one processed batch is marked as modified.
  *
  * rescan = internal OS buffers were overloaded, some events might be missing.
  * The `path` is going to be a folder needs to be rescanned
@@ -316,7 +316,7 @@ export interface WatchOptions {
 }
 
 /**
- * Receives raw batches of up to 128 events. Duplicate paths may appear.
+ * Receives normalized batches of up to 128 events. Each path appears once.
  */
 export type WatchBatchCallback = (events: WatchEvent[]) => void;
 
@@ -643,8 +643,8 @@ export interface FileFinderApi {
    *   is an exact file path.
    * - Omitted — subscribes to the entire indexed tree: `watch(callback)`.
    *
-   * The callback receives raw batches of up to 128 events; duplicate paths
-   * may appear. Unsubscribing takes
+   * The callback receives normalized batches of up to 128 events, with each
+   * path appearing at most once. Unsubscribing takes
    * effect synchronously: once it returns, the callback will not run again.
    *
    * Requires the instance to be created with watching enabled (default).

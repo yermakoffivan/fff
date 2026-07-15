@@ -68,9 +68,9 @@ asyncio.run(main())
 ### Watching files
 
 Subscribe to filesystem changes with a glob, an exact path, or a directory
-subtree (requires `watch=True`, the default). The callback receives one
-raw batches of up to 128 events on a dedicated callback thread. Duplicate
-paths may appear; avoid long-running work so later callbacks are not delayed.
+subtree (requires `watch=True`, the default). The callback receives normalized
+batches of up to 128 events on a dedicated callback thread. Each path appears
+at most once; avoid long-running work so later callbacks are not delayed.
 
 ```python
 from fff import FileFinder
