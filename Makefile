@@ -99,7 +99,7 @@ SMOKE_BIN := $(TARGET_DIR)/fff_c_smoke
 SMOKE_SRC := crates/fff-c/tests/smoke.c
 SMOKE_INCLUDE := crates/fff-c/include
 
-test-c-smoke: build-c-lib
+test-c-smoke: build
 	$(CC) $(CFLAGS) -I $(SMOKE_INCLUDE) -L $(TARGET_DIR) \
 		-Wl,-rpath,@loader_path/../target/release \
 		-Wl,-rpath,$$(pwd)/$(TARGET_DIR) \
